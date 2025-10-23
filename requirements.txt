@@ -1,0 +1,5 @@
+# Prototype Pollution Detector - Dependencies
+
+# No runtime dependencies required for the basic version
+# Add JavaScript parsing libraries if needed, e.g.:
+# esprima>=4.0.1
