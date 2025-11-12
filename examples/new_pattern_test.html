@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>New Pattern Test</title>
+</head>
+<body>
+    <!-- This is a NEW pattern - not data-pace-options, but custom-config -->
+    <div custom-config='{"__proto__": {"polluted": "YOU ARE POLLUTED!"}}'>
+        Test
+    </div>
+    
+    <!-- Another new pattern - id attribute with JSON -->
+    <input id="user-settings" value='{"__proto__": {"polluted": "test"}}'>
+    
+    <!-- Regular attribute (not data-*) -->
+    <span myattr='{"__proto__": {"polluted": "test"}}'>Content</span>
+    
+    <!-- Attribute with dangerous strings but not JSON -->
+    <div suspicious-attr='__proto__=polluted'>Test</div>
+    
+    <script>
+        // JSON.parse on any attribute
+        var data = JSON.parse(document.querySelector('[custom-config]').getAttribute('custom-config'));
+        extend({}, {}, data);  // Dangerous!
+        
+        // JSON.parse on localStorage (any key)
+        var stored = JSON.parse(localStorage.getItem('user-config'));
+        merge({}, stored);
+    </script>
+</body>
+</html>
+

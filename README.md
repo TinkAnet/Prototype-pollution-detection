@@ -68,26 +68,35 @@ prototype-pollution-detector crawl --repo owner/repo -o results.json
 
 ## What It Detects
 
-### 1. Direct Dangerous Property Assignments
+**Focus: Analyzing ALL functions for prototype pollution vulnerabilities**
+
+The detector analyzes every function in the codebase to check if its logic is vulnerable to prototype pollution, regardless of function name.
+
+### 1. Vulnerable Property Copying Functions
+```javascript
+// Detected regardless of function name
+function copyUserSettings(target, source) {
+    for (var key in source) {
+        target[key] = source[key];  // No validation - VULNERABLE!
+    }
+}
+```
+
+**Detection**: 
+- Analyzes ALL functions, not just those with suspicious names
+- Detects property copying patterns: `for...in` loops, `Object.keys().forEach()`, `Object.assign()`, etc.
+- Checks if functions validate dangerous properties (`__proto__`, `constructor`, `prototype`)
+
+**Severity**: HIGH if no validation, MEDIUM if partial validation
+
+### 2. Direct Dangerous Property Assignments
 ```javascript
 obj.__proto__.polluted = "test";  // HIGH severity
 ```
 
-### 2. Unsafe Merge/Extend Functions
-```javascript
-function extend(out, src) {
-    for (key in src) out[key] = src[key];  // No validation!
-}
-```
+**Detection**: Finds direct assignments to `__proto__`, `constructor`, or `prototype`.
 
-### 3. HTML Injection Vectors
-```html
-<img data-pace-options='{"__proto__": {"polluted": "test"}}'>
-```
-```javascript
-var data = JSON.parse(el.getAttribute("data-options"));
-extend({}, defaults, data);  // Dangerous chain!
-```
+**Severity**: HIGH
 
 ## Python API
 

@@ -39,30 +39,6 @@ class PrototypePollutionAnalyzer:
         "constructor",
     }
     
-    # Patterns that indicate potential pollution (unsafe merge/extend functions)
-    POLLUTION_PATTERNS = [
-        "merge",
-        "extend",
-        "clone",
-        "assign",
-        "deepCopy",
-        "deepMerge",
-        "deepExtend",
-        "deepClone",
-        "mixin",
-        "copyProperties",
-    ]
-    
-    # DOM methods that might retrieve user-controlled data
-    DOM_DATA_METHODS = [
-        "getAttribute",
-        "getAttributeNode",
-        "dataset",
-        "querySelector",
-        "getElementById",
-        "getElementsByClassName",
-    ]
-    
     def __init__(self, verbose: bool = False):
         """
         Initialize the analyzer.
@@ -77,6 +53,8 @@ class PrototypePollutionAnalyzer:
         """
         Analyze an AST for prototype pollution vulnerabilities.
         
+        Focus: Detect vulnerable merge/extend functions (source functions).
+        
         Args:
             ast: Parsed AST dictionary (from parser)
             
@@ -90,102 +68,115 @@ class PrototypePollutionAnalyzer:
         
         file_type = ast.get("file_type", "javascript")
         
-        # Analyze based on file type
+        # For HTML files, extract JavaScript and analyze merge functions
         if file_type == "html":
-            self._analyze_html_file(ast)
+            # Extract JavaScript from HTML and analyze merge functions
+            self._analyze_html_for_merge_functions(ast)
         else:
+            # Analyze JavaScript for merge/extend functions
             self._analyze_javascript_code(ast)
         
         return self.vulnerabilities
     
-    def _analyze_html_file(self, ast: Dict[str, Any]) -> None:
+    def _analyze_html_for_merge_functions(self, ast: Dict[str, Any]) -> None:
         """
-        Analyze HTML file for prototype pollution via HTML injection.
+        Analyze HTML file to extract JavaScript and detect vulnerable merge/extend functions.
+        
+        Focus: Only detect merge/extend functions, not HTML injection vectors.
         
         Args:
             ast: Parsed HTML AST dictionary
         """
-        # Check for dangerous data attributes (like pace-js vulnerability)
-        for data_attr in ast.get("data_attributes", []):
-            if data_attr.get("dangerous"):
-                self.vulnerabilities.append(Vulnerability(
-                    severity="high",
-                    line=data_attr.get("line", 0),
-                    column=0,
-                    message=(
-                        f"HTML injection vector detected: data attribute '{data_attr['attribute']}' "
-                        f"contains dangerous properties (__proto__, constructor, or prototype). "
-                        f"This could lead to prototype pollution if parsed and merged without validation."
-                    ),
-                    code_snippet=f"{data_attr['attribute']}='{data_attr['value'][:100]}'",
-                    vulnerability_type="html_injection_prototype_pollution",
-                ))
-            elif self._looks_like_options_attribute(data_attr.get("attribute", "")):
-                # Check if this looks like a library options pattern (e.g., data-pace-options)
-                self.vulnerabilities.append(Vulnerability(
-                    severity="medium",
-                    line=data_attr.get("line", 0),
-                    column=0,
-                    message=(
-                        f"Potential HTML injection vector: data attribute '{data_attr['attribute']}' "
-                        f"contains JSON that might be parsed and merged. Verify that the parsing code "
-                        f"validates property names before merging."
-                    ),
-                    code_snippet=f"{data_attr['attribute']}='{data_attr['value'][:100]}'",
-                    vulnerability_type="html_injection_suspicious",
-                ))
-        
-        # Analyze inline JavaScript in HTML
+        # Analyze inline JavaScript in HTML for merge functions
         for inline_script in ast.get("inline_scripts", []):
             self._analyze_javascript_code(inline_script)
         
-        # Analyze script tags for JSON.parse on DOM attributes
+        # Analyze script tags for merge functions
         for script_tag in ast.get("script_tags", []):
             script_content = script_tag.get("content", "")
             if script_content:
-                self._check_json_parse_on_dom(script_content, script_tag.get("line", 0))
+                # Parse the script content and analyze all functions
+                try:
+                    from .parser import JavaScriptParser
+                    parser = JavaScriptParser(verbose=self.verbose)
+                    script_ast = parser.parse_code(script_content, ast.get("file", ""))
+                    self._analyze_javascript_code(script_ast)
+                except Exception:
+                    # If parsing fails, try to extract functions via regex
+                    self._extract_functions_from_code(script_content, script_tag.get("line", 0))
     
-    def _looks_like_options_attribute(self, attr_name: str) -> bool:
+    def _extract_functions_from_code(self, code: str, start_line: int = 0) -> None:
         """
-        Check if an attribute name looks like a library options pattern.
+        Extract function definitions from raw code using regex.
         
-        This detects common patterns used by libraries to read configuration
-        from HTML data attributes, which can be exploited for HTML injection.
+        Used as fallback when AST parsing fails.
         
         Args:
-            attr_name: Attribute name to check
+            code: JavaScript code string
+            start_line: Starting line number
+        """
+        if start_line is None or not isinstance(start_line, int):
+            start_line = 0
+        
+        # Pattern to find function declarations: function name(...) { ... }
+        func_pattern = r'function\s+(\w+)\s*\([^)]*\)\s*\{([^}]*)\}'
+        for match in re.finditer(func_pattern, code, re.IGNORECASE | re.DOTALL):
+            func_name = match.group(1)
+            func_body = match.group(2)
+            line_num = start_line + code[:match.start()].count("\n")
+            
+            # Check if this function does property copying
+            if self._has_property_copying_pattern(func_body):
+                # Check if it validates
+                has_validation = self._has_property_validation(func_body)
+                
+                if not has_validation:
+                    self.vulnerabilities.append(Vulnerability(
+                        severity="high",
+                        line=line_num,
+                        column=0,
+                        message=(
+                            f"Function '{func_name}' performs property copying/merging "
+                            f"without validating dangerous properties. This makes it vulnerable "
+                            f"to prototype pollution attacks."
+                        ),
+                        code_snippet=match.group(0)[:300],
+                        vulnerability_type="vulnerable_property_copying",
+                    ))
+    
+    def _has_property_copying_pattern(self, code: str) -> bool:
+        """
+        Check if code contains property copying patterns.
+        
+        Args:
+            code: Code string to check
             
         Returns:
-            True if it looks like an options attribute
+            True if property copying pattern is found
         """
         patterns = [
-            r"data-.*-options?$",      # data-pace-options, data-app-options
-            r"data-options?$",          # data-options
-            r"data-.*-config$",         # data-app-config
-            r"data-config$",            # data-config
-            r"data-.*-settings?$",      # data-app-settings
-            r"data-settings?$",         # data-settings
-            r"data-.*-params?$",        # data-app-params
-            r"data-params?$",           # data-params
-            r"data-.*-init$",           # data-app-init
-            r"data-init$",              # data-init
+            r'for\s*\([^)]*\s+in\s+[^)]*\)',
+            r'\[[^\]]+\]\s*=\s*',
+            r'Object\.assign',
+            r'Object\.keys',
         ]
-        return any(re.match(pattern, attr_name, re.IGNORECASE) for pattern in patterns)
+        return any(re.search(pattern, code, re.IGNORECASE) for pattern in patterns)
     
     def _analyze_javascript_code(self, ast: Dict[str, Any]) -> None:
         """
-        Analyze JavaScript code for prototype pollution vulnerabilities.
+        Analyze ALL functions in JavaScript code for prototype pollution vulnerabilities.
+        
+        Checks every function to see if its logic is vulnerable, not just functions
+        with suspicious names.
         
         Args:
             ast: Parsed JavaScript AST dictionary
         """
-        # Check for unsafe extend/merge functions
+        # Analyze ALL functions, not just those with merge/extend names
         functions = ast.get("functions", [])
         for func in functions:
-            func_name = func.get("name") or ""
-            if func_name and any(pattern.lower() in func_name.lower() for pattern in self.POLLUTION_PATTERNS):
-                # This might be a merge/extend function - check if it's unsafe
-                self._check_unsafe_merge_function(func, ast)
+            # Check if this function's logic is vulnerable to prototype pollution
+            self._check_function_vulnerability(func, ast)
         
         # Check for direct dangerous property assignments
         assignments = ast.get("assignments", [])
@@ -194,8 +185,8 @@ class PrototypePollutionAnalyzer:
             if prop_name in self.DANGEROUS_PROPERTIES:
                 self.vulnerabilities.append(Vulnerability(
                     severity="high",
-                    line=assign.get("line", 0),
-                    column=assign.get("column", 0),
+                    line=assign.get("line", 0) or 0,
+                    column=assign.get("column", 0) or 0,
                     message=(
                         f"Direct assignment to dangerous property '{prop_name}'. "
                         f"This could lead to prototype pollution."
@@ -203,224 +194,144 @@ class PrototypePollutionAnalyzer:
                     code_snippet=assign.get("code", ""),
                     vulnerability_type="direct_dangerous_property_assignment",
                 ))
-        
-        # Check for JSON.parse calls that might parse user-controlled data
-        json_parse_calls = ast.get("json_parse_calls", [])
-        for json_parse in json_parse_calls:
-            self._check_json_parse_usage(json_parse, ast)
-        
-        # Check function calls for unsafe merge operations
-        function_calls = ast.get("function_calls", [])
-        for call in function_calls:
-            func_name = call.get("function") or ""
-            if func_name and any(pattern.lower() in func_name.lower() for pattern in self.POLLUTION_PATTERNS):
-                # Check if this merge call might be using JSON.parse results
-                call_code = call.get("code", "")
-                is_using_json_parse = "JSON.parse" in call_code or any(
-                    json_parse.get("line", 0) == call.get("line", 0) 
-                    for json_parse in json_parse_calls
-                )
-                
-                severity = "high" if is_using_json_parse else "medium"
-                message = (
-                    f"Call to merge/extend function '{func_name}' detected"
-                )
-                if is_using_json_parse:
-                    message += " with potential JSON.parse input. This is a high-risk HTML injection vector."
-                else:
-                    message += ". Verify that it validates property names before merging."
-                
-                self.vulnerabilities.append(Vulnerability(
-                    severity=severity,
-                    line=call.get("line", 0),
-                    column=call.get("column", 0),
-                    message=message,
-                    code_snippet=call.get("code", ""),
-                    vulnerability_type="unsafe_merge_call" if not is_using_json_parse else "html_injection_merge_chain",
-                ))
     
-    def _check_unsafe_merge_function(self, func: Dict[str, Any], ast: Dict[str, Any]) -> None:
+    def _check_function_vulnerability(self, func: Dict[str, Any], ast: Dict[str, Any]) -> None:
         """
-        Check if a merge/extend function is unsafe (doesn't validate property names).
+        Check if a function's logic is vulnerable to prototype pollution.
+        
+        Analyzes the function body to detect patterns that could lead to
+        prototype pollution, regardless of function name.
         
         Args:
             func: Function information dictionary
             ast: Full AST dictionary
         """
-        func_name = func.get("name", "")
-        func_line = func.get("line", 0)
+        func_name = func.get("name", "") or ""
         func_body = func.get("body", "")
+        func_line = func.get("line", 0) or 0
+        func_column = func.get("column", 0) or 0
         
-        # Check if function body validates dangerous properties
-        has_validation = False
-        if func_body:
-            # Look for checks for dangerous properties
-            validation_patterns = [
-                r'__proto__',
-                r'constructor',
-                r'prototype',
-                r'hasOwnProperty',
-                r'Object\.prototype',
-            ]
+        if not func_body:
+            return
+        
+        # Pattern 1: Check for property copying loops without validation
+        # e.g., for (key in src) { target[key] = src[key]; }
+        vulnerable_patterns = [
+            # Pattern: for...in loop with property assignment
+            r'for\s*\([^)]*\s+in\s+[^)]*\)\s*\{[^}]*\[[^\]]+\]\s*=\s*[^;]+;',
+            # Pattern: Object.keys/entries with property assignment
+            r'Object\.(keys|entries)\s*\([^)]+\)\s*\.(forEach|map)\s*\([^)]*=>[^}]*\[[^\]]+\]\s*=',
+            # Pattern: Object.assign without filtering
+            r'Object\.assign\s*\([^)]+\)',
+        ]
+        
+        has_property_copying = any(
+            re.search(pattern, func_body, re.IGNORECASE | re.DOTALL)
+            for pattern in vulnerable_patterns
+        )
+        
+        # Pattern 2: Check for spread operator usage (could be vulnerable)
+        has_spread_operator = '...' in func_body and ('Object.assign' in func_body or 'for' in func_body)
+        
+        # Pattern 3: Check for property access with dynamic keys
+        # e.g., obj[key] = value where key comes from a parameter
+        has_dynamic_property_assignment = bool(
+            re.search(r'\[[^\]]+\]\s*=\s*', func_body) and
+            ('for' in func_body.lower() or 'in' in func_body.lower())
+        )
+        
+        # If function does property copying/merging, check if it validates
+        if has_property_copying or has_spread_operator or has_dynamic_property_assignment:
+            # Check if function validates dangerous properties
+            has_validation = self._has_property_validation(func_body)
             
-            # Check if function checks for dangerous properties
-            for pattern in validation_patterns:
-                if re.search(pattern, func_body, re.IGNORECASE):
-                    # Check if it's actually validating (not just using)
-                    # Look for patterns like: if (key === '__proto__') or if (key !== '__proto__')
-                    validation_checks = [
-                        r'key\s*[!=]==\s*["\']__proto__["\']',
-                        r'key\s*[!=]==\s*["\']constructor["\']',
-                        r'key\s*[!=]==\s*["\']prototype["\']',
-                        r'__proto__\s*in\s*',
-                        r'hasOwnProperty\s*\(\s*["\']__proto__["\']',
-                        r'hasOwnProperty\s*\(\s*["\']constructor["\']',
-                        r'hasOwnProperty\s*\(\s*["\']prototype["\']',
-                        r'dangerousProperties',
-                        r'DANGEROUS_PROPERTIES',
-                    ]
-                    
-                    for check_pattern in validation_checks:
-                        if re.search(check_pattern, func_body, re.IGNORECASE):
-                            has_validation = True
-                            break
-                    
-                    if has_validation:
-                        break
-        
-        # If no validation found, flag as vulnerable
-        if not has_validation:
-            self.vulnerabilities.append(Vulnerability(
-                severity="high",
-                line=func_line,
-                column=func.get("column", 0),
-                message=(
-                    f"Unsafe merge/extend function '{func_name}' detected. "
-                    f"This function does not validate property names (__proto__, "
-                    f"constructor, prototype) before merging, making it vulnerable to "
-                    f"prototype pollution attacks."
-                ),
-                code_snippet=func_body[:200] if func_body else f"function {func_name}(...)",
-                vulnerability_type="unsafe_merge_function",
-            ))
-        else:
-            # Still flag as potentially unsafe but lower severity
-            self.vulnerabilities.append(Vulnerability(
-                severity="medium",
-                line=func_line,
-                column=func.get("column", 0),
-                message=(
-                    f"Merge/extend function '{func_name}' detected with some validation. "
-                    f"Please verify that all dangerous properties are properly checked."
-                ),
-                code_snippet=func_body[:200] if func_body else f"function {func_name}(...)",
-                vulnerability_type="unsafe_merge_function",
-            ))
-    
-    def _check_json_parse_usage(self, json_parse: Dict[str, Any], ast: Dict[str, Any]) -> None:
-        """
-        Check if JSON.parse is used in a potentially unsafe way.
-        
-        Args:
-            json_parse: JSON.parse call information
-            ast: Full AST dictionary
-        """
-        code_snippet = json_parse.get("code", "")
-        line = json_parse.get("line", 0)
-        
-        # Check if JSON.parse is called on DOM attribute data
-        # This covers various ways to get data from DOM elements
-        dom_patterns = [
-            r"\.getAttribute\s*\(",           # el.getAttribute("data-options")
-            r"\.dataset\.",                   # el.dataset.options
-            r"\.getAttributeNode\s*\(",        # el.getAttributeNode("data-options")
-            r"querySelector",                 # document.querySelector("[data-options]")
-            r"querySelectorAll",               # document.querySelectorAll("[data-options]")
-            r"getElementById",                 # document.getElementById("data-options")
-            r"getElementsByClassName",         # document.getElementsByClassName
-            r"getElementsByTagName",           # document.getElementsByTagName
-            r"\.innerHTML",                    # el.innerHTML (might contain JSON)
-            r"\.textContent",                  # el.textContent (might contain JSON)
-            r"\.innerText",                    # el.innerText (might contain JSON)
-            r"\.value",                        # input.value (form data)
-            r"localStorage\.getItem",          # localStorage.getItem (stored data)
-            r"sessionStorage\.getItem",        # sessionStorage.getItem (stored data)
-            r"location\.search",               # URL query parameters
-            r"location\.hash",                 # URL hash
-            r"URLSearchParams",                # URLSearchParams parsing
-        ]
-        
-        is_dom_related = any(re.search(pattern, code_snippet, re.IGNORECASE) for pattern in dom_patterns)
-        
-        if is_dom_related:
-            self.vulnerabilities.append(Vulnerability(
-                severity="high",
-                line=line,
-                column=json_parse.get("column", 0),
-                message=(
-                    "JSON.parse() called on DOM attribute data. This is a common HTML injection "
-                    "vector for prototype pollution (like pace-js vulnerability). "
-                    "Ensure parsed data is validated before merging into objects."
-                ),
-                code_snippet=code_snippet,
-                vulnerability_type="json_parse_dom_attribute",
-            ))
-        else:
-            # Still potentially dangerous if the result is merged without validation
-            self.vulnerabilities.append(Vulnerability(
-                severity="medium",
-                line=line,
-                column=json_parse.get("column", 0),
-                message=(
-                    "JSON.parse() detected. If the parsed result is merged into objects without "
-                    "validating property names, this could lead to prototype pollution."
-                ),
-                code_snippet=code_snippet,
-                vulnerability_type="json_parse_suspicious",
-            ))
-    
-    def _check_json_parse_on_dom(self, code: str, start_line: int) -> None:
-        """
-        Check for JSON.parse calls on DOM attributes in raw code.
-        
-        This detects HTML injection vectors where JSON.parse is used on
-        user-controlled DOM data that could contain prototype pollution payloads.
-        
-        Args:
-            code: JavaScript code string
-            start_line: Starting line number
-        """
-        # Pattern to find JSON.parse(getAttribute(...)) or similar
-        # These patterns indicate JSON.parse is being used on DOM data
-        patterns = [
-            r"JSON\.parse\s*\(\s*[^)]*\.getAttribute\s*\(",
-            r"JSON\.parse\s*\(\s*[^)]*\.dataset\.",
-            r"JSON\.parse\s*\(\s*[^)]*querySelector",
-            r"JSON\.parse\s*\(\s*[^)]*getElementById",
-            r"JSON\.parse\s*\(\s*[^)]*\.innerHTML",
-            r"JSON\.parse\s*\(\s*[^)]*\.textContent",
-            r"JSON\.parse\s*\(\s*[^)]*\.value",
-            r"JSON\.parse\s*\(\s*[^)]*localStorage",
-            r"JSON\.parse\s*\(\s*[^)]*sessionStorage",
-            r"JSON\.parse\s*\(\s*[^)]*location\.search",
-            r"JSON\.parse\s*\(\s*[^)]*location\.hash",
-        ]
-        
-        for pattern in patterns:
-            for match in re.finditer(pattern, code, re.IGNORECASE):
-                line_num = start_line + code[:match.start()].count("\n")
+            if not has_validation:
+                # This function is vulnerable!
+                func_display_name = func_name if func_name else "(anonymous)"
                 self.vulnerabilities.append(Vulnerability(
                     severity="high",
-                    line=line_num,
-                    column=0,
+                    line=func_line,
+                    column=func_column,
                     message=(
-                        "JSON.parse() called on DOM attribute data. This is a common HTML injection "
-                        "vector for prototype pollution. Ensure parsed data validates property names "
-                        "before merging into objects."
+                        f"Function '{func_display_name}' performs property copying/merging "
+                        f"without validating dangerous properties (__proto__, constructor, prototype). "
+                        f"This makes it vulnerable to prototype pollution attacks."
                     ),
-                    code_snippet=code[max(0, match.start()-30):match.end()+30],
-                    vulnerability_type="json_parse_dom_attribute",
+                    code_snippet=func_body[:300] if len(func_body) > 300 else func_body,
+                    vulnerability_type="vulnerable_property_copying",
                 ))
+            elif self._has_partial_validation(func_body):
+                # Partial validation - still potentially unsafe
+                func_display_name = func_name if func_name else "(anonymous)"
+                self.vulnerabilities.append(Vulnerability(
+                    severity="medium",
+                    line=func_line,
+                    column=func_column,
+                    message=(
+                        f"Function '{func_display_name}' performs property copying/merging "
+                        f"with partial validation. Please verify that all dangerous properties "
+                        f"are properly checked."
+                    ),
+                    code_snippet=func_body[:300] if len(func_body) > 300 else func_body,
+                    vulnerability_type="partially_safe_property_copying",
+                ))
+    
+    def _has_property_validation(self, func_body: str) -> bool:
+        """
+        Check if function body validates dangerous properties.
+        
+        Args:
+            func_body: Function body code
+            
+        Returns:
+            True if validation is present
+        """
+        validation_patterns = [
+            # Explicit checks for dangerous properties
+            r'key\s*[!=]==\s*["\']__proto__["\']',
+            r'key\s*[!=]==\s*["\']constructor["\']',
+            r'key\s*[!=]==\s*["\']prototype["\']',
+            r'["\']__proto__["\']\s*[!=]==\s*key',
+            r'["\']constructor["\']\s*[!=]==\s*key',
+            r'["\']prototype["\']\s*[!=]==\s*key',
+            # hasOwnProperty checks
+            r'hasOwnProperty\s*\(\s*["\']__proto__["\']',
+            r'hasOwnProperty\s*\(\s*["\']constructor["\']',
+            r'hasOwnProperty\s*\(\s*["\']prototype["\']',
+            # Object.prototype checks
+            r'Object\.prototype\.hasOwnProperty',
+            # Dangerous properties arrays/sets
+            r'DANGEROUS_PROPERTIES',
+            r'dangerousProperties',
+            r'__proto__.*constructor.*prototype',
+            # Continue/return statements that skip dangerous properties
+            r'if\s*\([^)]*(?:__proto__|constructor|prototype)[^)]*\)\s*(?:continue|return)',
+        ]
+        
+        return any(
+            re.search(pattern, func_body, re.IGNORECASE)
+            for pattern in validation_patterns
+        )
+    
+    def _has_partial_validation(self, func_body: str) -> bool:
+        """
+        Check if function has partial validation (checks some but not all dangerous properties).
+        
+        Args:
+            func_body: Function body code
+            
+        Returns:
+            True if partial validation is present
+        """
+        # Check if it validates at least one dangerous property but not all
+        checks_proto = bool(re.search(r'__proto__', func_body, re.IGNORECASE))
+        checks_constructor = bool(re.search(r'constructor', func_body, re.IGNORECASE))
+        checks_prototype = bool(re.search(r'\bprototype\b', func_body, re.IGNORECASE))
+        
+        # If it checks at least one but not all three, it's partial
+        checked_count = sum([checks_proto, checks_constructor, checks_prototype])
+        return 1 <= checked_count < 3
+    
     
     def check_property_assignment(self, node: Dict[str, Any]) -> bool:
         """
@@ -434,34 +345,6 @@ class PrototypePollutionAnalyzer:
         """
         prop_name = node.get("property", "")
         return prop_name in self.DANGEROUS_PROPERTIES
-    
-    def check_merge_operation(self, node: Dict[str, Any]) -> bool:
-        """
-        Check if a merge/extend operation is vulnerable.
-        
-        Args:
-            node: AST node representing a merge operation
-            
-        Returns:
-            True if the operation is vulnerable
-        """
-        func_name = node.get("function", "")
-        return any(pattern.lower() in func_name.lower() for pattern in self.POLLUTION_PATTERNS)
-    
-    def check_user_controlled_access(self, node: Dict[str, Any]) -> bool:
-        """
-        Check if property access uses user-controlled input.
-        
-        Args:
-            node: AST node representing property access
-            
-        Returns:
-            True if the access uses user-controlled input
-        """
-        # This would require more sophisticated taint analysis
-        # For now, we check for common DOM methods
-        code = node.get("code", "")
-        return any(method in code for method in self.DOM_DATA_METHODS)
     
     def get_vulnerability_report(self) -> Dict[str, Any]:
         """

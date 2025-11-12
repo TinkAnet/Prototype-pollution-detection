@@ -128,38 +128,48 @@ class JavaScriptParser:
                             if self.verbose:
                                 print(f"Warning: Could not parse inline script: {e}")
             
-            # Extract data attributes that might contain JSON (HTML injection vectors)
+            # Extract ALL attributes that might contain JSON (general HTML injection detection)
+            # This is more general than just looking for specific patterns - we check everything
             all_elements = soup.find_all(True)  # Find all elements
             for element in all_elements:
                 for attr_name, attr_value in element.attrs.items():
-                    # Check data-* attributes and also id/name attributes that might be used for config
-                    if isinstance(attr_value, str):
-                        is_data_attr = attr_name.startswith("data-")
-                        is_config_attr = attr_name.lower() in ["id", "name", "class"] and \
-                                         ("options" in attr_value.lower() or "config" in attr_value.lower())
+                    if isinstance(attr_value, str) and len(attr_value.strip()) > 0:
+                        # Check if attribute value looks like JSON (potential injection vector)
+                        # We check ALL attributes, not just data-* or specific patterns
+                        looks_like_json = self._looks_like_json(attr_value)
+                        contains_dangerous_strings = any(
+                            prop in attr_value for prop in ["__proto__", "constructor", "prototype"]
+                        )
                         
-                        if is_data_attr or is_config_attr:
-                            # Check if it looks like JSON
-                            if self._looks_like_json(attr_value):
-                                data_info = {
-                                    "element": element.name,
-                                    "attribute": attr_name,
-                                    "value": attr_value,
-                                    "id": element.get("id"),
-                                    "line": getattr(element, "sourceline", None),
-                                }
-                                result["data_attributes"].append(data_info)
-                                
-                                # Try to parse as JSON to check for dangerous properties
+                        # Flag if it's JSON or contains dangerous strings
+                        # This catches ANY attribute that could be exploited
+                        if looks_like_json or contains_dangerous_strings:
+                            data_info = {
+                                "element": element.name,
+                                "attribute": attr_name,
+                                "value": attr_value,
+                                "id": element.get("id"),
+                                "line": getattr(element, "sourceline", None),
+                                "is_json": looks_like_json,
+                            }
+                            
+                            # Try to parse as JSON to check for dangerous properties
+                            if looks_like_json:
                                 try:
                                     parsed_json = json.loads(attr_value)
                                     if self._contains_dangerous_properties(parsed_json):
                                         data_info["dangerous"] = True
                                 except (json.JSONDecodeError, TypeError):
-                                    # Even if not valid JSON, check if it contains dangerous strings
-                                    if any(prop in attr_value for prop in ["__proto__", "constructor", "prototype"]):
+                                    # Invalid JSON but might still be dangerous
+                                    if contains_dangerous_strings:
                                         data_info["dangerous"] = True
                                         data_info["invalid_json"] = True
+                            elif contains_dangerous_strings:
+                                # Not JSON but contains dangerous strings
+                                data_info["dangerous"] = True
+                                data_info["contains_dangerous_strings"] = True
+                            
+                            result["data_attributes"].append(data_info)
             
             # Parse all JavaScript code found
             all_js_code = "\n".join([s.string for s in script_tags if s.string])
@@ -208,47 +218,44 @@ class JavaScriptParser:
                 except Exception:
                     pass
         
-        # Extract data attributes and config attributes
-        # Pattern for data-* attributes
-        data_pattern = r'data-(\w+)=["\']([^"\']+)["\']'
-        data_matches = re.finditer(data_pattern, content)
-        for match in data_matches:
-            attr_name = f"data-{match.group(1)}"
+        # Extract ALL attributes that might contain JSON or dangerous strings
+        # General pattern: any-attribute="value" - we check everything
+        # This is more general than just data-* attributes
+        attr_pattern = r'(\w+)=["\']([^"\']+)["\']'
+        attr_matches = re.finditer(attr_pattern, content)
+        for match in attr_matches:
+            attr_name = match.group(1)
             attr_value = match.group(2)
-            if self._looks_like_json(attr_value) or any(prop in attr_value for prop in ["__proto__", "constructor", "prototype"]):
+            
+            # Check if value looks like JSON or contains dangerous strings
+            # We check ALL attributes, not just specific ones
+            looks_like_json = self._looks_like_json(attr_value)
+            contains_dangerous = any(
+                prop in attr_value for prop in ["__proto__", "constructor", "prototype"]
+            )
+            
+            if looks_like_json or contains_dangerous:
                 data_info = {
                     "attribute": attr_name,
                     "value": attr_value,
                     "line": content[:match.start()].count("\n") + 1,
+                    "is_json": looks_like_json,
                 }
+                
                 # Check for dangerous properties
-                try:
-                    parsed_json = json.loads(attr_value)
-                    if self._contains_dangerous_properties(parsed_json):
-                        data_info["dangerous"] = True
-                except (json.JSONDecodeError, TypeError):
-                    if any(prop in attr_value for prop in ["__proto__", "constructor", "prototype"]):
-                        data_info["dangerous"] = True
-                result["data_attributes"].append(data_info)
-        
-        # Also check id/name attributes that might contain config (like id="data-pace-options")
-        id_pattern = r'(?:id|name)=["\']([^"\']*(?:data-|options|config)[^"\']*)["\']'
-        id_matches = re.finditer(id_pattern, content, re.IGNORECASE)
-        for match in id_matches:
-            attr_value = match.group(1)
-            if self._looks_like_json(attr_value) or any(prop in attr_value for prop in ["__proto__", "constructor", "prototype"]):
-                data_info = {
-                    "attribute": "id" if "id=" in match.group(0) else "name",
-                    "value": attr_value,
-                    "line": content[:match.start()].count("\n") + 1,
-                }
-                try:
-                    parsed_json = json.loads(attr_value)
-                    if self._contains_dangerous_properties(parsed_json):
-                        data_info["dangerous"] = True
-                except (json.JSONDecodeError, TypeError):
-                    if any(prop in attr_value for prop in ["__proto__", "constructor", "prototype"]):
-                        data_info["dangerous"] = True
+                if looks_like_json:
+                    try:
+                        parsed_json = json.loads(attr_value)
+                        if self._contains_dangerous_properties(parsed_json):
+                            data_info["dangerous"] = True
+                    except (json.JSONDecodeError, TypeError):
+                        if contains_dangerous:
+                            data_info["dangerous"] = True
+                            data_info["invalid_json"] = True
+                elif contains_dangerous:
+                    data_info["dangerous"] = True
+                    data_info["contains_dangerous_strings"] = True
+                
                 result["data_attributes"].append(data_info)
         
         return result
