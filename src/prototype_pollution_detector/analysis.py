@@ -146,19 +146,19 @@ class PrototypePollutionAnalyzer:
     
     def _has_property_copying_pattern(self, code: str) -> bool:
         """
-        Check if code contains property copying patterns.
+        Check if code contains recursive merge patterns.
         
         Args:
             code: Code string to check
             
         Returns:
-            True if property copying pattern is found
+            True if recursive merge pattern is found
         """
+        # Check for recursive merge indicators
         patterns = [
-            r'for\s*\([^)]*\s+in\s+[^)]*\)',
-            r'\[[^\]]+\]\s*=\s*',
-            r'Object\.assign',
-            r'Object\.keys',
+            r'for\s*\([^)]*\s+in\s+[^)]*\)',  # for...in loop
+            r'typeof\s+[^=]+\s*===\s*["\']object["\']',  # Type checking
+            r'\[[^\]]+\]\s*=\s*',  # Property assignment
         ]
         return any(re.search(pattern, code, re.IGNORECASE) for pattern in patterns)
     
@@ -199,8 +199,9 @@ class PrototypePollutionAnalyzer:
         """
         Check if a function's logic is vulnerable to prototype pollution.
         
-        Analyzes the function body to detect patterns that could lead to
-        prototype pollution, regardless of function name.
+        Focus: Detects recursive/deep merge functions that are vulnerable.
+        Prototype pollution typically occurs in recursive merge functions that
+        traverse nested objects without validating dangerous properties.
         
         Args:
             func: Function information dictionary
@@ -214,51 +215,27 @@ class PrototypePollutionAnalyzer:
         if not func_body:
             return
         
-        # Pattern 1: Check for property copying loops without validation
-        # e.g., for (key in src) { target[key] = src[key]; }
-        vulnerable_patterns = [
-            # Pattern: for...in loop with property assignment
-            r'for\s*\([^)]*\s+in\s+[^)]*\)\s*\{[^}]*\[[^\]]+\]\s*=\s*[^;]+;',
-            # Pattern: Object.keys/entries with property assignment
-            r'Object\.(keys|entries)\s*\([^)]+\)\s*\.(forEach|map)\s*\([^)]*=>[^}]*\[[^\]]+\]\s*=',
-            # Pattern: Object.assign without filtering
-            r'Object\.assign\s*\([^)]+\)',
-        ]
+        # Focus on recursive/deep merge patterns - these are the main source of prototype pollution
+        is_recursive_merge = self._is_recursive_merge_function(func_name, func_body, ast)
         
-        has_property_copying = any(
-            re.search(pattern, func_body, re.IGNORECASE | re.DOTALL)
-            for pattern in vulnerable_patterns
-        )
-        
-        # Pattern 2: Check for spread operator usage (could be vulnerable)
-        has_spread_operator = '...' in func_body and ('Object.assign' in func_body or 'for' in func_body)
-        
-        # Pattern 3: Check for property access with dynamic keys
-        # e.g., obj[key] = value where key comes from a parameter
-        has_dynamic_property_assignment = bool(
-            re.search(r'\[[^\]]+\]\s*=\s*', func_body) and
-            ('for' in func_body.lower() or 'in' in func_body.lower())
-        )
-        
-        # If function does property copying/merging, check if it validates
-        if has_property_copying or has_spread_operator or has_dynamic_property_assignment:
+        if is_recursive_merge:
             # Check if function validates dangerous properties
             has_validation = self._has_property_validation(func_body)
             
             if not has_validation:
-                # This function is vulnerable!
+                # This recursive merge function is vulnerable!
                 func_display_name = func_name if func_name else "(anonymous)"
                 self.vulnerabilities.append(Vulnerability(
                     severity="high",
                     line=func_line,
                     column=func_column,
                     message=(
-                        f"Function '{func_display_name}' performs property copying/merging "
+                        f"Recursive merge function '{func_display_name}' performs deep property copying "
                         f"without validating dangerous properties (__proto__, constructor, prototype). "
                         f"This makes it vulnerable to prototype pollution attacks."
                     ),
                     code_snippet=func_body[:300] if len(func_body) > 300 else func_body,
-                    vulnerability_type="vulnerable_property_copying",
+                    vulnerability_type="vulnerable_recursive_merge",
                 ))
             elif self._has_partial_validation(func_body):
                 # Partial validation - still potentially unsafe
@@ -268,13 +245,110 @@ class PrototypePollutionAnalyzer:
                     line=func_line,
                     column=func_column,
                     message=(
-                        f"Function '{func_display_name}' performs property copying/merging "
+                        f"Recursive merge function '{func_display_name}' performs deep property copying "
                         f"with partial validation. Please verify that all dangerous properties "
-                        f"are properly checked."
+                        f"are properly checked before recursive merging."
                     ),
                     code_snippet=func_body[:300] if len(func_body) > 300 else func_body,
-                    vulnerability_type="partially_safe_property_copying",
+                    vulnerability_type="partially_safe_recursive_merge",
                 ))
+    
+    def _is_recursive_merge_function(self, func_name: str, func_body: str, ast: Dict[str, Any]) -> bool:
+        """
+        Check if a function is a recursive/deep merge function.
+        
+        Recursive merge functions are the main source of prototype pollution because
+        they traverse nested objects and can copy properties from __proto__.
+        
+        Args:
+            func_name: Function name
+            func_body: Function body code
+            ast: Full AST dictionary
+            
+        Returns:
+            True if this is a recursive merge function
+        """
+        # Pattern 1: Function calls itself recursively (classic recursive merge)
+        if func_name:
+            # Check if function calls itself: extend(out[key], val) or merge(target[key], source[key])
+            recursive_call_pattern = rf'\b{re.escape(func_name)}\s*\('
+            if re.search(recursive_call_pattern, func_body, re.IGNORECASE):
+                # Also check if it's merging nested objects
+                if self._has_nested_object_merge_pattern(func_body):
+                    return True
+        
+        # Pattern 2: Deep merge pattern - checks if value is object and merges recursively
+        # e.g., if (typeof val === 'object') { merge(target[key], val); }
+        deep_merge_patterns = [
+            r'typeof\s+[^=]+\s*===\s*["\']object["\']',
+            r'typeof\s+[^=]+\s*==\s*["\']object["\']',
+            r'val\s*!=\s*null\s*&&\s*typeof\s+val\s*===\s*["\']object["\']',
+            r'Array\.isArray\s*\(',
+        ]
+        
+        has_type_check = any(
+            re.search(pattern, func_body, re.IGNORECASE)
+            for pattern in deep_merge_patterns
+        )
+        
+        # Pattern 3: Checks for nested objects and then does recursive assignment
+        # e.g., if (out[key] != null && typeof out[key] === 'object') { extend(out[key], val); }
+        has_nested_merge = self._has_nested_object_merge_pattern(func_body)
+        
+        # Pattern 4: Uses Object.assign or spread with nested object handling
+        has_object_assign_with_nesting = (
+            'Object.assign' in func_body and
+            ('typeof' in func_body or 'Array.isArray' in func_body)
+        )
+        
+        # Pattern 5: for...in loop with recursive property copying
+        # This is the classic vulnerable pattern: for (key in source) { if (isObject) { recursiveMerge(); } else { assign(); } }
+        has_for_in_with_recursion = bool(
+            re.search(r'for\s*\([^)]*\s+in\s+[^)]*\)', func_body, re.IGNORECASE) and
+            has_type_check and
+            re.search(r'\[[^\]]+\]\s*=\s*', func_body)
+        )
+        
+        # Must have property copying AND recursive/nested handling
+        has_property_copying = bool(
+            re.search(r'\[[^\]]+\]\s*=\s*', func_body) or
+            'Object.assign' in func_body or
+            re.search(r'for\s*\([^)]*\s+in\s+[^)]*\)', func_body, re.IGNORECASE)
+        )
+        
+        # Return true if it has recursive merge characteristics
+        return (
+            (has_for_in_with_recursion) or
+            (has_nested_merge and has_property_copying) or
+            (has_object_assign_with_nesting and has_property_copying) or
+            (has_type_check and has_property_copying and 'for' in func_body.lower())
+        )
+    
+    def _has_nested_object_merge_pattern(self, func_body: str) -> bool:
+        """
+        Check if function has patterns that indicate nested object merging.
+        
+        Args:
+            func_body: Function body code
+            
+        Returns:
+            True if nested object merge pattern is found
+        """
+        patterns = [
+            # Pattern: if (target[key] != null && typeof target[key] === 'object') { merge(); }
+            r'\[[^\]]+\]\s*!=\s*null',
+            r'typeof\s+[^=]+\s*\[[^\]]+\]\s*===\s*["\']object["\']',
+            # Pattern: Recursive call with nested property access
+            r'\w+\s*\([^)]*\[[^\]]+\][^)]*\)',
+            # Pattern: Deep copy/merge indicators
+            r'deep',
+            r'recursive',
+        ]
+        
+        return any(
+            re.search(pattern, func_body, re.IGNORECASE)
+            for pattern in patterns
+        )
     
     def _has_property_validation(self, func_body: str) -> bool:
         """

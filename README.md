@@ -68,24 +68,35 @@ prototype-pollution-detector crawl --repo owner/repo -o results.json
 
 ## What It Detects
 
-**Focus: Analyzing ALL functions for prototype pollution vulnerabilities**
+**Focus: Detecting recursive/deep merge functions vulnerable to prototype pollution**
 
-The detector analyzes every function in the codebase to check if its logic is vulnerable to prototype pollution, regardless of function name.
+The detector analyzes all functions to identify recursive/deep merge functions that traverse nested objects without validating dangerous properties. These are the main source of prototype pollution vulnerabilities.
 
-### 1. Vulnerable Property Copying Functions
+### 1. Vulnerable Recursive Merge Functions
 ```javascript
-// Detected regardless of function name
-function copyUserSettings(target, source) {
-    for (var key in source) {
-        target[key] = source[key];  // No validation - VULNERABLE!
+// Recursive merge - traverses nested objects
+function extend(out, src) {
+    for (key in src) {
+        val = src[key];
+        if (out[key] != null && typeof out[key] === 'object' && typeof val === 'object') {
+            extend(out[key], val);  // Recursive call - VULNERABLE!
+        } else {
+            out[key] = val;  // No validation of __proto__, constructor, prototype
+        }
     }
 }
 ```
 
 **Detection**: 
 - Analyzes ALL functions, not just those with suspicious names
-- Detects property copying patterns: `for...in` loops, `Object.keys().forEach()`, `Object.assign()`, etc.
-- Checks if functions validate dangerous properties (`__proto__`, `constructor`, `prototype`)
+- Detects recursive merge patterns: functions that call themselves recursively
+- Detects deep merge patterns: functions that check `typeof === 'object'` and merge nested objects
+- Checks if functions validate dangerous properties (`__proto__`, `constructor`, `prototype`) before recursive merging
+
+**Why Recursive Merges are Dangerous**: 
+- They traverse nested objects recursively
+- When encountering `__proto__` as a key, they recursively merge into `Object.prototype`
+- This allows attackers to pollute the prototype chain
 
 **Severity**: HIGH if no validation, MEDIUM if partial validation
 
