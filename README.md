@@ -1,186 +1,121 @@
 # Prototype Pollution Detection Tool
 
-A tool for detecting client-side prototype pollution vulnerabilities in JavaScript code.
+A static analysis tool for detecting client-side prototype pollution vulnerabilities in JavaScript and HTML files.
 
 **Group Project** - Web Security Class at Johns Hopkins University  
-**Team Members:** Letao Zhao, Ethan Lee, Bingyan He, Qi Sun
+**Team:** Letao Zhao, Ethan Lee, Bingyan He, Qi Sun
 
-## Overview
+## What is Prototype Pollution?
 
-Prototype pollution is a critical vulnerability in JavaScript that occurs when an attacker can inject properties into existing object prototypes. This tool analyzes JavaScript code to identify potential prototype pollution vulnerabilities.
+Prototype pollution occurs when attackers inject properties into JavaScript object prototypes (like `Object.prototype`). This can lead to security issues like XSS and CSRF attacks.
 
 ## Features
 
-- 🔍 Static analysis of JavaScript files
-- 📁 Recursive directory scanning
-- 📊 Detailed vulnerability reports
-- 🎯 Multiple severity levels (high, medium, low)
-- 💻 Command-line interface
-- 📝 JSON output support
+- ✅ Static analysis of JavaScript and HTML files
+- ✅ Detects HTML injection vectors (like pace-js vulnerability)
+- ✅ GitHub crawler for finding vulnerable code
+- ✅ LLM-assisted analysis (optional)
+- ✅ Detailed vulnerability reports with severity levels
 
-## Installation
+## Quick Start
 
-### From Source
+### Installation
 
 ```bash
-# Clone the repository
+# Clone and install
 git clone https://github.com/TinkAnet/Prototype-pollution-detection.git
 cd Prototype-pollution-detection
-
-# Install the package
+pip install -r requirements.txt
 pip install -e .
-
-# Or install with development dependencies
-pip install -e ".[dev]"
 ```
 
-### Using pip (once published)
+### Setup API Keys
+
+Create a `.env` file:
 
 ```bash
-pip install prototype-pollution-detector
+cp .env.example .env
 ```
+
+Add your keys:
+- `GITHUB_TOKEN` - **Required** for GitHub crawler (create at https://github.com/settings/tokens)
+- `OPENAI_API_KEY` - Optional for LLM analysis
 
 ## Usage
 
-### Command-Line Interface
+### Analyze Local Files
 
-Analyze a single JavaScript file:
 ```bash
-prototype-pollution-detector path/to/file.js
+# Single file
+prototype-pollution-detector analyze file.js
+
+# Directory
+prototype-pollution-detector analyze src/
+
+# Save results
+prototype-pollution-detector analyze file.js -o results.json
 ```
 
-Analyze a directory (recursively):
+### Crawl GitHub
+
 ```bash
-prototype-pollution-detector path/to/directory/
+# Search GitHub
+prototype-pollution-detector crawl --max-results 50 -o results.json
+
+# Specific repository
+prototype-pollution-detector crawl --repo owner/repo -o results.json
 ```
 
-Save results to a JSON file:
-```bash
-prototype-pollution-detector path/to/file.js -o results.json
+## What It Detects
+
+### 1. Direct Dangerous Property Assignments
+```javascript
+obj.__proto__.polluted = "test";  // HIGH severity
 ```
 
-Enable verbose output:
-```bash
-prototype-pollution-detector path/to/file.js --verbose
+### 2. Unsafe Merge/Extend Functions
+```javascript
+function extend(out, src) {
+    for (key in src) out[key] = src[key];  // No validation!
+}
 ```
 
-Display help:
-```bash
-prototype-pollution-detector --help
+### 3. HTML Injection Vectors
+```html
+<img data-pace-options='{"__proto__": {"polluted": "test"}}'>
+```
+```javascript
+var data = JSON.parse(el.getAttribute("data-options"));
+extend({}, defaults, data);  // Dangerous chain!
 ```
 
-### Python API
+## Python API
 
 ```python
-from pathlib import Path
 from prototype_pollution_detector import PrototypePollutionDetector
 
-# Create a detector instance
-detector = PrototypePollutionDetector(verbose=True)
-
-# Analyze a file or directory
-results = detector.analyze(Path("path/to/file.js"))
-
-# Print results to console
+detector = PrototypePollutionDetector()
+results = detector.analyze(Path("file.js"))
 detector.print_results(results)
-
-# Save results to a file
-detector.save_results(results, Path("output.json"))
 ```
 
-## Project Structure
+## Examples
 
-```
-Prototype-pollution-detection/
-├── src/
-│   └── prototype_pollution_detector/
-│       ├── __init__.py          # Package initialization
-│       ├── cli.py               # Command-line interface
-│       ├── detector.py          # Main detector orchestration
-│       ├── parser.py            # JavaScript parsing module
-│       └── analysis.py          # Vulnerability analysis logic
-├── tests/
-│   ├── __init__.py
-│   ├── test_cli.py              # CLI tests
-│   ├── test_detector.py         # Detector tests
-│   ├── test_parser.py           # Parser tests
-│   └── test_analysis.py         # Analysis tests
-├── setup.py                     # Setup configuration
-├── pyproject.toml               # Modern Python project configuration
-├── requirements.txt             # Package dependencies
-├── README.md                    # This file
-├── LICENSE                      # MIT License
-└── .gitignore                   # Git ignore rules
-```
+See `examples/` directory:
+- `pace_vulnerability.html` - HTML injection example
+- `unsafe_extend.js` - Vulnerable code
+- `safe_extend.js` - Safe version
 
-## Development
+## Documentation
 
-### Running Tests
-
-```bash
-# Run all tests
-python -m pytest tests/
-
-# Run with coverage
-python -m pytest --cov=prototype_pollution_detector tests/
-
-# Run specific test file
-python -m pytest tests/test_cli.py
-```
-
-### Code Formatting
-
-```bash
-# Format code with black
-black src/ tests/
-
-# Check code style
-flake8 src/ tests/
-
-# Type checking
-mypy src/
-```
-
-## Detection Capabilities
-
-This tool currently provides a framework for detecting:
-
-- Direct `__proto__` assignments
-- Unsafe merge/extend operations
-- User-controlled property access
-- Recursive property copying without safeguards
-
-**Note:** The current version provides stubs and a framework. Full detection capabilities will be implemented in future versions.
+- [Quick Start Guide](QUICKSTART.md) - Get started quickly
+- [Detection Logic](DETECTION_LOGIC.md) - How detection works
+- [Design Document](DESIGN.md) - Architecture details
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+Contributions welcome! Fork, create a branch, and submit a PR.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Johns Hopkins University Web Security Class
-- Course instructors and teaching assistants
-- Security research community
-
-## Future Work
-
-- [ ] Implement full JavaScript AST parsing
-- [ ] Add support for popular JavaScript libraries
-- [ ] Taint analysis for user input tracking
-- [ ] Integration with CI/CD pipelines
-- [ ] VSCode extension
-- [ ] Web-based interface
-
-## Contact
-
-For questions or feedback, please open an issue on GitHub.
+MIT License - see [LICENSE](LICENSE) file.

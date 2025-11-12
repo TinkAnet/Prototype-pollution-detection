@@ -66,13 +66,13 @@ class PrototypePollutionDetector:
             print(f"Analyzing file: {file_path}")
         
         # Check file extension
-        if file_path.suffix not in {".js", ".jsx", ".mjs", ".cjs"}:
+        if file_path.suffix not in {".js", ".jsx", ".mjs", ".cjs", ".html", ".htm"}:
             if self.verbose:
-                print(f"Skipping non-JavaScript file: {file_path}")
+                print(f"Skipping unsupported file: {file_path}")
             return {
                 "file": str(file_path),
                 "skipped": True,
-                "reason": "Not a JavaScript file",
+                "reason": "Not a JavaScript or HTML file",
             }
         
         try:
@@ -123,9 +123,9 @@ class PrototypePollutionDetector:
             "total_vulnerabilities": 0,
         }
         
-        # Find all JavaScript files
+        # Find all JavaScript and HTML files
         js_files = []
-        for pattern in ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"]:
+        for pattern in ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.html", "**/*.htm"]:
             js_files.extend(dir_path.glob(pattern))
         
         # Analyze each file

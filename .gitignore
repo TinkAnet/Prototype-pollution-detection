@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project-specific output files
+results.json
+test_results.json
+*_results.json
+crawl_results.json
+repo_results.json

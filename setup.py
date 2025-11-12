@@ -32,8 +32,9 @@ setup(
     ],
     python_requires=">=3.8",
     install_requires=[
-        # Add dependencies here as needed
-        # Example: "esprima>=4.0.1",  # For JavaScript parsing
+        "esprima>=4.0.1",  # For JavaScript parsing
+        "beautifulsoup4>=4.12.0",  # For HTML parsing
+        "lxml>=4.9.0",  # HTML parser backend
     ],
     extras_require={
         "dev": [

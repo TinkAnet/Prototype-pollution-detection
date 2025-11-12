@@ -1,5 +1,23 @@
 # Prototype Pollution Detector - Dependencies
 
-# No runtime dependencies required for the basic version
-# Add JavaScript parsing libraries if needed, e.g.:
-# esprima>=4.0.1
+# JavaScript parsing library
+esprima>=4.0.1
+
+# HTML parsing for detecting HTML injection vectors
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# GitHub API client
+PyGithub>=2.1.0
+
+# OpenAI API client
+openai>=1.12.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Rate limiting
+ratelimit>=2.2.1
