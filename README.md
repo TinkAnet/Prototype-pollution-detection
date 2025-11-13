@@ -1,21 +1,26 @@
 # Prototype Pollution Detection Tool
 
-A static analysis tool for detecting client-side prototype pollution vulnerabilities in JavaScript and HTML files.
+A static analysis tool for detecting prototype pollution vulnerabilities in JavaScript and HTML files using semantic AST analysis and taint tracking.
 
 **Group Project** - Web Security Class at Johns Hopkins University  
 **Team:** Letao Zhao, Ethan Lee, Bingyan He, Qi Sun
 
 ## What is Prototype Pollution?
 
-Prototype pollution occurs when attackers inject properties into JavaScript object prototypes (like `Object.prototype`). This can lead to security issues like XSS and CSRF attacks.
+Prototype pollution occurs when attackers inject properties into JavaScript object prototypes (like `Object.prototype`). This can lead to security issues like XSS and CSRF attacks. The vulnerability typically occurs when user-controlled data flows into merge/extend functions that copy properties without validating dangerous keys like `__proto__`, `constructor`, or `prototype`.
 
 ## Features
 
-- ✅ Static analysis of JavaScript and HTML files
-- ✅ Detects HTML injection vectors (like pace-js vulnerability)
-- ✅ GitHub crawler for finding vulnerable code
-- ✅ LLM-assisted analysis (optional)
-- ✅ Detailed vulnerability reports with severity levels
+- Semantic AST analysis (no regex pattern matching)
+- Source-to-sink taint tracking across files
+- Detects data flow from sources (JSON.parse, DOM attributes, user input) to sinks (merge/extend functions)
+- Cross-file analysis for multi-file codebases
+- Guard detection (recognizes hasOwnProperty checks and property exclusion guards)
+- Performance optimizations (O(1) parent lookups, precomputed sink functions)
+- Detects HTML injection vectors (like pace-js vulnerability)
+- GitHub crawler for finding vulnerable code
+- LLM-assisted analysis (optional)
+- Detailed vulnerability reports with severity levels
 
 ## Quick Start
 
@@ -68,39 +73,68 @@ prototype-pollution-detector crawl --repo owner/repo -o results.json
 
 ## What It Detects
 
-**Focus: Detecting recursive/deep merge functions vulnerable to prototype pollution**
+**Focus: Source-to-sink taint analysis for prototype pollution vulnerabilities**
 
-The detector analyzes all functions to identify recursive/deep merge functions that traverse nested objects without validating dangerous properties. These are the main source of prototype pollution vulnerabilities.
+The detector performs comprehensive taint analysis to track data flow from untrusted sources to vulnerable sink functions. It uses semantic AST analysis (not regex) to identify actual vulnerabilities with high precision.
 
-### 1. Vulnerable Recursive Merge Functions
+### Detection Capabilities
+
+#### 1. Source Detection
+
+The tool identifies data sources that could contain user-controlled input:
+
+- **JSON.parse() calls**: `var data = JSON.parse(userInput);`
+- **DOM attribute access**: `element.getAttribute('data-config')`, `element.dataset.config`
+- **Query selectors**: `document.querySelector('[data-config]')`
+- **User input**: Form field values, URL parameters, request bodies
+
+#### 2. Sink Detection
+
+The tool identifies vulnerable operations (sinks) where tainted data could cause prototype pollution:
+
+- **Property assignments**: `target[key] = source[key]` (computed property access)
+- **Object.assign**: `Object.assign(target, source)`
+- **Object.defineProperty/defineProperties**: Property definition operations
+- **Object.setPrototypeOf**: Prototype manipulation
+- **Merge/extend functions**: Custom functions that copy properties without validation
+- **Library helpers**: Recognizes common library functions like `_.merge`, `$.extend`, `deepmerge`
+
+#### 3. Source-to-Sink Flow Tracking
+
+The tool tracks taint propagation across files:
+
 ```javascript
-// Recursive merge - traverses nested objects
-function extend(out, src) {
-    for (key in src) {
-        val = src[key];
-        if (out[key] != null && typeof out[key] === 'object' && typeof val === 'object') {
-            extend(out[key], val);  // Recursive call - VULNERABLE!
-        } else {
-            out[key] = val;  // No validation of __proto__, constructor, prototype
-        }
+// File: source.js
+var userConfig = JSON.parse(element.getAttribute('data-config'));  // SOURCE
+
+// File: sink.js  
+function extend(target, source) {
+    for (var key in source) {
+        target[key] = source[key];  // SINK - no validation
     }
 }
+
+// File: main.js
+extend({}, userConfig);  // FLOW: tainted data flows from source to sink
 ```
 
-**Detection**: 
-- Analyzes ALL functions, not just those with suspicious names
-- Detects recursive merge patterns: functions that call themselves recursively
-- Detects deep merge patterns: functions that check `typeof === 'object'` and merge nested objects
-- Checks if functions validate dangerous properties (`__proto__`, `constructor`, `prototype`) before recursive merging
+**Detection**: The tool detects that `userConfig` is tainted from a JSON.parse source and flows into the vulnerable `extend` function, creating a prototype pollution vulnerability.
 
-**Why Recursive Merges are Dangerous**: 
-- They traverse nested objects recursively
-- When encountering `__proto__` as a key, they recursively merge into `Object.prototype`
-- This allows attackers to pollute the prototype chain
+#### 4. Guard Recognition
 
-**Severity**: HIGH if no validation, MEDIUM if partial validation
+The tool recognizes when sinks are protected by validation:
 
-### 2. Direct Dangerous Property Assignments
+- **Property exclusion**: `if (key !== '__proto__' && key !== 'constructor' && key !== 'prototype')`
+- **hasOwnProperty checks**: `if (source.hasOwnProperty(key))` or `Object.prototype.hasOwnProperty.call(source, key)`
+- **Safe targets**: `Object.assign(Object.create(null), source)` (null prototype is safer)
+
+**Severity**: 
+- HIGH: Sink with no validation
+- MEDIUM: Sink with partial validation or safe target
+- LOW: Sink with full validation (still reported for awareness)
+
+#### 5. Direct Dangerous Property Assignments
+
 ```javascript
 obj.__proto__.polluted = "test";  // HIGH severity
 ```
@@ -108,6 +142,17 @@ obj.__proto__.polluted = "test";  // HIGH severity
 **Detection**: Finds direct assignments to `__proto__`, `constructor`, or `prototype`.
 
 **Severity**: HIGH
+
+### Analysis Approach
+
+- **Semantic AST Analysis**: Uses Abstract Syntax Tree traversal instead of regex patterns
+- **Cross-file Analysis**: Tracks taint across multiple files in a codebase
+- **Performance Optimized**: 
+  - Single-pass AST indexing with parent pointers
+  - O(1) sink function lookups
+  - Precomputed function indexes
+- **Accurate Guard Detection**: Walks AST ancestors to detect guards that protect sinks
+- **Deduplication**: Prevents duplicate vulnerability reports
 
 ## Python API
 
@@ -121,10 +166,15 @@ detector.print_results(results)
 
 ## Examples
 
-See `examples/` directory:
-- `pace_vulnerability.html` - HTML injection example
-- `unsafe_extend.js` - Vulnerable code
-- `safe_extend.js` - Safe version
+See `examples/` directory for complete test cases:
+
+- `example1_client_side_json_parse/` - Client-side JSON.parse source to merge sink
+- `example2_server_side_nodejs/` - Server-side Node.js request parsing to merge sink
+- `example3_mixed_html_js/` - Mixed HTML and JavaScript with DOM sources
+- `example4_dom_chain/` - Complex DOM attribute extraction to merge sink
+- `example5_express_server/` - Express.js server with request body parsing
+
+Each example demonstrates source-to-sink data flow across different files, showing how the tool detects taint propagation.
 
 ## Documentation
 

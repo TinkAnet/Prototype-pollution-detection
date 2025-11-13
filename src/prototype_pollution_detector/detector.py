@@ -128,13 +128,44 @@ class PrototypePollutionDetector:
         for pattern in ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.html", "**/*.htm"]:
             js_files.extend(dir_path.glob(pattern))
         
-        # Analyze each file
+        # First pass: Analyze each file and collect ASTs
         for js_file in js_files:
             file_result = self._analyze_file(js_file)
             results["files"].append(file_result)
+        
+        # Second pass: Perform cross-file taint analysis
+        self.analyzer.finalize_analysis()
+        
+        # Update results with final vulnerabilities
+        final_vulns = self.analyzer.vulnerabilities
+        results["total_vulnerabilities"] = len(final_vulns)
+        
+        # Update file results with final vulnerabilities
+        # Match vulnerabilities to files by checking which AST they came from
+        for file_result in results["files"]:
+            file_path = file_result.get("file", "")
+            file_vulns = []
+            for v in final_vulns:
+                # Check if vulnerability belongs to this file
+                # We'll match by checking if the file path matches
+                # (vulnerabilities store file info in their context)
+                if hasattr(v, 'file') and v.file == file_path:
+                    file_vulns.append(v)
+                elif file_path in str(v.code_snippet) or file_path in v.message:
+                    file_vulns.append(v)
             
-            if "vulnerability_count" in file_result:
-                results["total_vulnerabilities"] += file_result["vulnerability_count"]
+            file_result["vulnerabilities"] = [
+                {
+                    "severity": v.severity,
+                    "line": v.line,
+                    "column": v.column,
+                    "message": v.message,
+                    "code_snippet": v.code_snippet,
+                    "type": v.vulnerability_type,
+                }
+                for v in file_vulns
+            ]
+            file_result["vulnerability_count"] = len(file_vulns)
         
         return results
     

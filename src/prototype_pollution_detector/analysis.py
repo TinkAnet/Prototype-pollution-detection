@@ -6,7 +6,7 @@ and HTML files to identify potential prototype pollution vulnerabilities.
 Uses semantic AST analysis instead of regex pattern matching.
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 
 
@@ -21,6 +21,7 @@ class Vulnerability:
     message: str
     code_snippet: str
     vulnerability_type: str
+    file: str = ""  # File where vulnerability was found
 
 
 class PrototypePollutionAnalyzer:
@@ -32,11 +33,27 @@ class PrototypePollutionAnalyzer:
     """
     
     # Common dangerous property names that could lead to pollution
-    DANGEROUS_PROPERTIES = {
+    DANGEROUS_PROPERTIES = frozenset({
         "__proto__",
         "prototype",
         "constructor",
+    })
+    
+    # Extra sink callsites and library merge hints
+    SINK_CALLEES = {
+        "Object.assign",
+        "Object.defineProperty",
+        "Object.defineProperties",
+        "Object.setPrototypeOf",
+        "Reflect.setPrototypeOf",
     }
+    
+    MERGE_NAME_HINTS = {  # for libs and helpers
+        "extend", "merge", "deepmerge", "mergeWith", "assignIn", "defaultsDeep", 
+        "mixin", "cloneDeep", "applyToDefaults", "assignDeep"
+    }
+    
+    SAFE_TARGET_CREATORS = {"Object.create"}  # Object.create(null) target is safer
     
     def __init__(self, verbose: bool = False):
         """
@@ -47,14 +64,22 @@ class PrototypePollutionAnalyzer:
         """
         self.verbose = verbose
         self.vulnerabilities: List[Vulnerability] = []
-        self.sources: List[Dict[str, Any]] = []  # Track data sources
-        self.data_flow: Dict[str, List[str]] = {}  # Track variable assignments
+        self.sources: List[Dict[str, Any]] = []  # Track data sources globally
+        self.tainted_vars: Dict[str, Dict[str, Any]] = {}  # Track tainted variables: {var_name: {source_info}}
+        self.function_calls: List[Dict[str, Any]] = []  # Track function calls for taint propagation
+        self.all_asts: List[Dict[str, Any]] = []  # Store all ASTs for cross-file analysis
+        
+        # Indexing for performance
+        self.parent_map: Dict[int, Dict[str, Any]] = {}  # child-id -> parent-node
+        self.func_index: Dict[str, List[Dict[str, Any]]] = {}  # name -> [{"node": <fn node>, "file": str}]
+        self.sink_function_names: Set[str] = set()  # names known to contain sinks
+        self._seen_vulns: Set[Tuple[str, int, int, str]] = set()  # (file, line, col, type) for dedup
     
     def analyze_ast(self, ast: Dict[str, Any]) -> List[Vulnerability]:
         """
         Analyze an AST for prototype pollution vulnerabilities.
         
-        Focus: Detect vulnerable merge/extend functions (source functions).
+        This method collects ASTs for cross-file taint analysis.
         
         Args:
             ast: Parsed AST dictionary (from parser)
@@ -62,7 +87,8 @@ class PrototypePollutionAnalyzer:
         Returns:
             List of detected vulnerabilities
         """
-        self.vulnerabilities = []
+        # Store AST for later cross-file analysis
+        self.all_asts.append(ast)
         
         if self.verbose:
             print(f"Analyzing AST from {ast.get('file', 'unknown')}")
@@ -78,6 +104,30 @@ class PrototypePollutionAnalyzer:
             self._analyze_javascript_code(ast)
         
         return self.vulnerabilities
+    
+    def finalize_analysis(self) -> None:
+        """
+        Perform cross-file taint analysis after all files are analyzed.
+        
+        This method:
+        1. Builds taint propagation graph across all files
+        2. Tracks taint through function calls
+        3. Detects source-to-sink flows
+        """
+        if len(self.all_asts) <= 1:
+            return  # No cross-file analysis needed
+        
+        if self.verbose:
+            print("Performing cross-file taint analysis...")
+        
+        # Step 1: Collect all sources and build taint map
+        self._build_global_taint_map()
+        
+        # Step 2: Propagate taint through assignments and function calls
+        self._propagate_taint()
+        
+        # Step 3: Check sinks for tainted data
+        self._check_tainted_sinks()
     
     def _analyze_html_for_merge_functions(self, ast: Dict[str, Any]) -> None:
         """
@@ -118,28 +168,30 @@ class PrototypePollutionAnalyzer:
         Args:
             ast: Parsed JavaScript AST dictionary
         """
-        # Reset tracking for new AST
-        self.sources = []
-        self.data_flow = {}
+        # NEW: Index parent pointers + functions and precompute sinks once
+        self._index_ast(ast)
         
         # Step 1: Detect sources (JSON.parse, DOM attributes, user input)
         self._detect_sources(ast)
         
-        # Step 2: Track data flow (variable assignments)
-        self._track_data_flow(ast)
+        # Step 2: Track initial taint (variable assignments from sources)
+        self._track_initial_taint(ast)
         
-        # Step 3: Analyze ALL functions for vulnerabilities
+        # Step 3: Extract function calls for taint propagation
+        self._extract_function_calls(ast)
+        
+        # Step 4: Analyze ALL functions for vulnerabilities (sinks)
         functions = ast.get("functions", [])
         for func in functions:
             # Check if this function's logic is vulnerable to prototype pollution
             self._check_function_vulnerability(func, ast)
         
-        # Step 4: Check for direct dangerous property assignments
+        # Step 5: Check for direct dangerous property assignments
         assignments = ast.get("assignments", [])
         for assign in assignments:
             prop_name = assign.get("property", "")
             if prop_name in self.DANGEROUS_PROPERTIES:
-                self.vulnerabilities.append(Vulnerability(
+                self._add_vuln(
                     severity="high",
                     line=assign.get("line", 0) or 0,
                     column=assign.get("column", 0) or 0,
@@ -149,7 +201,66 @@ class PrototypePollutionAnalyzer:
                     ),
                     code_snippet=assign.get("code", ""),
                     vulnerability_type="direct_dangerous_property_assignment",
-                ))
+                    file=ast.get("file", ""),
+                )
+    
+    def _index_ast(self, ast: Dict[str, Any]) -> None:
+        """
+        Index AST once: build parent pointers, function index, and precompute sinks.
+        
+        Args:
+            ast: Parsed AST dictionary
+        """
+        root = ast.get("ast")
+        if not root:
+            return
+        
+        # Build parent pointers once
+        self._build_parent_map(root, None)
+        
+        # Build function index & precompute which functions contain sinks
+        funcs = ast.get("functions", [])
+        for f in funcs:
+            node = f.get("ast_node") or self._traverse_ast_for_function(ast, f.get("name", ""), f.get("line", 0))
+            if not node:
+                continue
+            
+            name = f.get("name", "")
+            if name:
+                self.func_index.setdefault(name, []).append({
+                    "node": node,
+                    "file": ast.get("file", "")
+                })
+                
+                # Precompute sink presence once per function
+                func_body = node.get("body", {})
+                sinks = self._find_prototype_pollution_sinks(func_body, name)
+                if sinks["has_sink"]:
+                    self.sink_function_names.add(name)
+    
+    def _build_parent_map(self, node: Any, parent: Optional[Dict[str, Any]]) -> None:
+        """
+        Build parent pointer map for efficient parent lookups.
+        
+        Args:
+            node: AST node
+            parent: Parent node (None for root)
+        """
+        if not isinstance(node, dict):
+            return
+        
+        if parent is not None:
+            self.parent_map[id(node)] = parent
+        
+        for k, v in node.items():
+            if k in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(v, dict):
+                self._build_parent_map(v, node)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        self._build_parent_map(item, node)
     
     def _detect_sources(self, ast: Dict[str, Any]) -> None:
         """
@@ -179,12 +290,13 @@ class PrototypePollutionAnalyzer:
                 "variable": None,  # Will be extracted from AST
             })
     
-    def _find_sources_in_ast(self, node: Any) -> None:
+    def _find_sources_in_ast(self, node: Any, parent: Optional[Any] = None) -> None:
         """
         Recursively find source nodes in AST.
         
         Args:
             node: AST node to analyze
+            parent: Parent node for context
         """
         if not isinstance(node, dict):
             return
@@ -197,8 +309,7 @@ class PrototypePollutionAnalyzer:
             callee_name = self._get_function_name_from_ast(callee)
             
             if callee_name == "JSON.parse":
-                # Find the variable this is assigned to
-                variable_name = self._get_assigned_variable(node)
+                variable_name = self._get_assigned_variable(node, parent)
                 source_info = {
                     "type": "json_parse",
                     "line": node.get("loc", {}).get("start", {}).get("line"),
@@ -210,7 +321,7 @@ class PrototypePollutionAnalyzer:
             
             # Detect DOM attribute access patterns
             elif callee_name and ("getAttribute" in callee_name or "dataset" in callee_name):
-                variable_name = self._get_assigned_variable(node)
+                variable_name = self._get_assigned_variable(node, parent)
                 source_info = {
                     "type": "dom_attribute",
                     "line": node.get("loc", {}).get("start", {}).get("line"),
@@ -223,8 +334,7 @@ class PrototypePollutionAnalyzer:
             
             # Detect querySelector/querySelectorAll (often used with getAttribute)
             elif callee_name and "querySelector" in callee_name:
-                # Check if result is used with getAttribute
-                variable_name = self._get_assigned_variable(node)
+                variable_name = self._get_assigned_variable(node, parent)
                 if variable_name:
                     source_info = {
                         "type": "dom_query",
@@ -240,10 +350,9 @@ class PrototypePollutionAnalyzer:
         elif node_type == "MemberExpression":
             prop_name = self._get_property_name_from_ast(node)
             if prop_name in ("value", "textContent", "innerHTML"):
-                # Check if accessing form element
                 obj_name = self._get_object_name_from_ast(node)
                 if obj_name:
-                    variable_name = self._get_assigned_variable(node)
+                    variable_name = self._get_assigned_variable(node, parent)
                     source_info = {
                         "type": "user_input",
                         "line": node.get("loc", {}).get("start", {}).get("line"),
@@ -255,32 +364,47 @@ class PrototypePollutionAnalyzer:
                     }
                     self.sources.append(source_info)
         
-        # Recursively search children
+        # Recursively search children with parent context
         for key, value in node.items():
             if key in ("loc", "range", "leadingComments", "trailingComments"):
                 continue
             if isinstance(value, dict):
-                self._find_sources_in_ast(value)
+                self._find_sources_in_ast(value, node)
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
-                        self._find_sources_in_ast(item)
+                        self._find_sources_in_ast(item, node)
     
     def _get_assigned_variable(self, node: Any, parent: Optional[Any] = None) -> Optional[str]:
         """
-        Get the variable name that a node is assigned to.
+        Climb to the nearest VariableDeclarator or AssignmentExpression using parent map.
         
         Args:
             node: AST node (usually a CallExpression)
-            parent: Parent node (for context)
+            parent: Parent node (if explicitly provided)
             
         Returns:
             Variable name or None
         """
-        # This method is called during AST traversal, so we need to check
-        # if the node is part of a VariableDeclarator or AssignmentExpression
-        # We'll extract this during the traversal in _extract_variable_assignments
-        # For now, return None - the actual extraction happens in _extract_variable_assignments
+        cur = node
+        # If parent explicitly provided, start there; otherwise, use parent_map
+        if parent is None:
+            parent = self.parent_map.get(id(cur))
+        
+        while parent:
+            ptype = parent.get("type")
+            if ptype == "VariableDeclarator":
+                var_id = parent.get("id", {})
+                if var_id.get("type") == "Identifier":
+                    return var_id.get("name")
+                return None
+            if ptype == "AssignmentExpression":
+                left = parent.get("left", {})
+                if left.get("type") == "Identifier":
+                    return left.get("name")
+                return None
+            cur = parent
+            parent = self.parent_map.get(id(cur))
         return None
     
     def _get_object_name_from_ast(self, member_expr: Dict[str, Any]) -> Optional[str]:
@@ -305,11 +429,11 @@ class PrototypePollutionAnalyzer:
         
         return None
     
-    def _track_data_flow(self, ast: Dict[str, Any]) -> None:
+    def _track_initial_taint(self, ast: Dict[str, Any]) -> None:
         """
-        Track data flow by analyzing variable assignments.
+        Track initial taint by analyzing variable assignments from sources.
         
-        This builds a map of which variables are assigned from sources.
+        This marks variables as tainted when they're assigned from sources.
         
         Args:
             ast: Parsed AST dictionary
@@ -318,9 +442,103 @@ class PrototypePollutionAnalyzer:
         if not ast_root:
             return
         
-        self._extract_variable_assignments(ast_root)
+        self._extract_variable_assignments(ast_root, ast.get("file", "unknown"))
     
-    def _extract_variable_assignments(self, node: Any) -> None:
+    def _extract_function_calls(self, ast: Dict[str, Any]) -> None:
+        """
+        Extract function calls for taint propagation analysis.
+        
+        Args:
+            ast: Parsed AST dictionary
+        """
+        ast_root = ast.get("ast")
+        if not ast_root:
+            return
+        
+        self._find_function_calls(ast_root, ast.get("file", "unknown"))
+    
+    def _find_function_calls(self, node: Any, filename: str, parent: Optional[Any] = None) -> None:
+        """
+        Recursively find function call expressions.
+        
+        Args:
+            node: AST node
+            filename: Current filename
+            parent: Parent node for context
+        """
+        if not isinstance(node, dict):
+            return
+        
+        node_type = node.get("type")
+        
+        if node_type == "CallExpression":
+            callee = node.get("callee", {})
+            func_name = self._get_function_name_from_ast(callee)
+            args = node.get("arguments", [])
+            
+            # Extract argument variables and check for direct sources
+            arg_info = []
+            for arg in args:
+                arg_var = None
+                is_direct_source = False
+                source_type = None
+                
+                if arg.get("type") == "Identifier":
+                    arg_var = arg.get("name")
+                elif arg.get("type") == "MemberExpression":
+                    obj = arg.get("object", {})
+                    if obj.get("type") == "Identifier":
+                        arg_var = obj.get("name")
+                elif arg.get("type") == "CallExpression":
+                    # Check if argument is a direct source call (e.g., extend({}, JSON.parse(...)))
+                    arg_callee = arg.get("callee", {})
+                    arg_callee_name = self._get_function_name_from_ast(arg_callee)
+                    if arg_callee_name == "JSON.parse":
+                        is_direct_source = True
+                        source_type = "json_parse"
+                    elif arg_callee_name and ("getAttribute" in arg_callee_name or "dataset" in arg_callee_name):
+                        is_direct_source = True
+                        source_type = "dom_attribute"
+                
+                arg_info.append({
+                    "variable": arg_var,
+                    "is_direct_source": is_direct_source,
+                    "source_type": source_type,
+                    "arg_node": arg,
+                })
+            
+            # Find what variable this call is assigned to
+            assigned_var = None
+            if parent and parent.get("type") == "VariableDeclarator":
+                var_id = parent.get("id", {})
+                if var_id.get("type") == "Identifier":
+                    assigned_var = var_id.get("name")
+            elif parent and parent.get("type") == "AssignmentExpression":
+                left = parent.get("left", {})
+                if left.get("type") == "Identifier":
+                    assigned_var = left.get("name")
+            
+            self.function_calls.append({
+                "function": func_name,
+                "arguments": arg_info,
+                "assigned_to": assigned_var,
+                "line": node.get("loc", {}).get("start", {}).get("line"),
+                "file": filename,
+                "node": node,
+            })
+        
+        # Recursively search children
+        for key, value in node.items():
+            if key in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(value, dict):
+                self._find_function_calls(value, filename, node)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        self._find_function_calls(item, filename, node)
+    
+    def _extract_variable_assignments(self, node: Any, filename: str) -> None:
         """
         Extract variable assignments to track data flow.
         
@@ -346,22 +564,31 @@ class PrototypePollutionAnalyzer:
                     callee_name = self._get_function_name_from_ast(callee)
                     
                     if callee_name == "JSON.parse":
-                        if var_name not in self.data_flow:
-                            self.data_flow[var_name] = []
-                        self.data_flow[var_name].append("json_parse")
-                        # Update source with variable name
+                        # Mark variable as tainted
+                        self.tainted_vars[var_name] = {
+                            "source_type": "json_parse",
+                            "source_line": init.get("loc", {}).get("start", {}).get("line"),
+                            "source_file": filename,
+                            "tainted_at": "variable_declaration",
+                        }
                         self._update_source_variable(init, var_name)
                     
                     elif callee_name and ("getAttribute" in callee_name or "dataset" in callee_name):
-                        if var_name not in self.data_flow:
-                            self.data_flow[var_name] = []
-                        self.data_flow[var_name].append("dom_attribute")
+                        self.tainted_vars[var_name] = {
+                            "source_type": "dom_attribute",
+                            "source_line": init.get("loc", {}).get("start", {}).get("line"),
+                            "source_file": filename,
+                            "tainted_at": "variable_declaration",
+                        }
                         self._update_source_variable(init, var_name)
                     
                     elif callee_name and "querySelector" in callee_name:
-                        if var_name not in self.data_flow:
-                            self.data_flow[var_name] = []
-                        self.data_flow[var_name].append("dom_query")
+                        self.tainted_vars[var_name] = {
+                            "source_type": "dom_query",
+                            "source_line": init.get("loc", {}).get("start", {}).get("line"),
+                            "source_file": filename,
+                            "tainted_at": "variable_declaration",
+                        }
                         self._update_source_variable(init, var_name)
                 
                 # Check for nested patterns like: var x = element.getAttribute('data')
@@ -370,9 +597,21 @@ class PrototypePollutionAnalyzer:
                     obj = init.get("object", {})
                     prop = init.get("property", {})
                     if prop.get("type") == "Identifier" and prop.get("name") in ("getAttribute", "dataset"):
-                        if var_name not in self.data_flow:
-                            self.data_flow[var_name] = []
-                        self.data_flow[var_name].append("dom_attribute")
+                        self.tainted_vars[var_name] = {
+                            "source_type": "dom_attribute",
+                            "source_line": init.get("loc", {}).get("start", {}).get("line"),
+                            "source_file": filename,
+                            "tainted_at": "variable_declaration",
+                        }
+                
+                # Check if init is a tainted variable (taint propagation)
+                elif init.get("type") == "Identifier":
+                    init_var = init.get("name")
+                    if init_var in self.tainted_vars:
+                        # Propagate taint
+                        self.tainted_vars[var_name] = self.tainted_vars[init_var].copy()
+                        self.tainted_vars[var_name]["tainted_at"] = "assignment"
+                        self.tainted_vars[var_name]["propagated_from"] = init_var
         
         # Track assignment expressions: x = JSON.parse(...)
         elif node_type == "AssignmentExpression":
@@ -388,27 +627,42 @@ class PrototypePollutionAnalyzer:
                     callee_name = self._get_function_name_from_ast(callee)
                     
                     if callee_name == "JSON.parse":
-                        if var_name not in self.data_flow:
-                            self.data_flow[var_name] = []
-                        self.data_flow[var_name].append("json_parse")
+                        self.tainted_vars[var_name] = {
+                            "source_type": "json_parse",
+                            "source_line": right.get("loc", {}).get("start", {}).get("line"),
+                            "source_file": filename,
+                            "tainted_at": "assignment",
+                        }
                         self._update_source_variable(right, var_name)
                     
                     elif callee_name and ("getAttribute" in callee_name or "dataset" in callee_name):
-                        if var_name not in self.data_flow:
-                            self.data_flow[var_name] = []
-                        self.data_flow[var_name].append("dom_attribute")
+                        self.tainted_vars[var_name] = {
+                            "source_type": "dom_attribute",
+                            "source_line": right.get("loc", {}).get("start", {}).get("line"),
+                            "source_file": filename,
+                            "tainted_at": "assignment",
+                        }
                         self._update_source_variable(right, var_name)
+                
+                # Check if right side is a tainted variable (taint propagation)
+                elif right.get("type") == "Identifier":
+                    right_var = right.get("name")
+                    if right_var in self.tainted_vars:
+                        # Propagate taint
+                        self.tainted_vars[var_name] = self.tainted_vars[right_var].copy()
+                        self.tainted_vars[var_name]["tainted_at"] = "assignment"
+                        self.tainted_vars[var_name]["propagated_from"] = right_var
         
         # Recursively search children
         for key, value in node.items():
             if key in ("loc", "range", "leadingComments", "trailingComments"):
                 continue
             if isinstance(value, dict):
-                self._extract_variable_assignments(value)
+                self._extract_variable_assignments(value, filename)
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
-                        self._extract_variable_assignments(item)
+                        self._extract_variable_assignments(item, filename)
     
     def _update_source_variable(self, node: Any, var_name: str) -> None:
         """
@@ -470,14 +724,15 @@ class PrototypePollutionAnalyzer:
             
             code_snippet = func.get("body", "")[:300] if func.get("body") else ""
             
-            self.vulnerabilities.append(Vulnerability(
+            self._add_vuln(
                 severity=severity,
                 line=func_line,
                 column=func_column,
                 message=message,
                 code_snippet=code_snippet,
                 vulnerability_type=analysis_result.get("vulnerability_type", "vulnerable_function"),
-            ))
+                file=ast.get("file", ""),
+            )
     
     def _find_function_in_ast(self, ast: Dict[str, Any], func_name: str, line: int) -> Optional[Dict[str, Any]]:
         """
@@ -515,7 +770,8 @@ class PrototypePollutionAnalyzer:
         node_type = node.get("type")
         node_line = node.get("loc", {}).get("start", {}).get("line")
         
-        if node_type in ("FunctionDeclaration", "FunctionExpression"):
+        # Support arrow functions too
+        if node_type in ("FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"):
             func_id = node.get("id", {})
             if func_id and func_id.get("name") == func_name:
                 if node_line == line or line == 0:
@@ -610,6 +866,165 @@ class PrototypePollutionAnalyzer:
         
         return result
     
+    def _build_global_taint_map(self) -> None:
+        """
+        Build global taint map across all files.
+        
+        This collects all sources and initial taint assignments.
+        """
+        # Sources are already collected during _detect_sources calls
+        # Tainted vars are already collected during _track_initial_taint
+        if self.verbose:
+            print(f"  Found {len(self.sources)} sources")
+            print(f"  Found {len(self.tainted_vars)} tainted variables")
+    
+    def _propagate_taint(self) -> None:
+        """
+        Propagate taint through assignments and function calls.
+        
+        This implements taint analysis by tracking how tainted data flows
+        through variable assignments and function parameters.
+        """
+        # Propagate taint through assignments (already done in _extract_variable_assignments)
+        # Now propagate through function calls
+        
+        for call in self.function_calls:
+            func_name = call.get("function")
+            args = call.get("arguments", [])
+            
+            # Check if any argument is tainted or is a direct source
+            tainted_args = []
+            for arg_info in args:
+                arg_var = arg_info.get("variable")
+                is_direct_source = arg_info.get("is_direct_source", False)
+                source_type = arg_info.get("source_type")
+                
+                if is_direct_source:
+                    # Direct source in function call (e.g., extend({}, JSON.parse(...)))
+                    tainted_args.append({
+                        "variable": None,
+                        "is_direct_source": True,
+                        "source_type": source_type,
+                        "taint_info": {
+                            "source_type": source_type,
+                            "source_line": call.get("line"),
+                            "source_file": call.get("file"),
+                        }
+                    })
+                elif arg_var and arg_var in self.tainted_vars:
+                    # Tainted variable passed as argument
+                    tainted_args.append({
+                        "variable": arg_var,
+                        "is_direct_source": False,
+                        "taint_info": self.tainted_vars[arg_var]
+                    })
+            
+            # If function is a sink and receives tainted data, mark it
+            if tainted_args and self._is_sink_function(func_name):
+                call["tainted"] = True
+                call["tainted_args"] = tainted_args
+    
+    def _is_sink_function(self, func_name: Optional[str]) -> bool:
+        """
+        Check if a function is a known sink (vulnerable merge/extend function).
+        
+        O(1) lookup using precomputed sink_function_names set.
+        
+        Args:
+            func_name: Function name
+            
+        Returns:
+            True if function is a sink
+        """
+        if not func_name:
+            return False
+        
+        # O(1) lookup in precomputed set
+        if func_name in self.sink_function_names:
+            return True
+        
+        # Library helpers (e.g., $.extend, _.merge, deepmerge)
+        last = func_name.split(".")[-1]
+        return last in self.MERGE_NAME_HINTS
+    
+    def _check_tainted_sinks(self) -> None:
+        """
+        Check sinks for tainted data and create source-to-sink vulnerabilities.
+        """
+        # Check function calls that are sinks and receive tainted data
+        for call in self.function_calls:
+            if call.get("tainted"):
+                tainted_args = call.get("tainted_args", [])
+                if tainted_args:
+                    func_name = call.get("function")
+                    call_line = call.get("line")
+                    call_file = call.get("file")
+                    
+                    # Find corresponding vulnerability for this sink function
+                    for vuln in self.vulnerabilities:
+                        # Match by function name in message or by checking if it's the sink function
+                        if func_name and (func_name.lower() in vuln.message.lower() or 
+                                         self._vulnerability_matches_function(vuln, func_name)):
+                            # Enhance vulnerability with source information
+                            taint_arg = tainted_args[0]
+                            taint_info = taint_arg["taint_info"]
+                            
+                            if taint_arg.get("is_direct_source"):
+                                # Direct source in function call
+                                source_info = {
+                                    "type": taint_info.get("source_type", "unknown"),
+                                    "line": call_line,
+                                    "file": call_file,
+                                    "variable": None,
+                                    "direct": True,
+                                }
+                                vuln.message = (
+                                    f"Function '{func_name}' receives tainted data directly from {source_info['type']} source "
+                                    f"at line {call_line} in {call_file} and performs property copying/merging "
+                                    f"without validating dangerous properties. This creates a prototype pollution vulnerability."
+                                )
+                            else:
+                                # Tainted variable passed as argument
+                                source_info = {
+                                    "type": taint_info.get("source_type", "unknown"),
+                                    "line": taint_info.get("source_line"),
+                                    "file": taint_info.get("source_file"),
+                                    "variable": taint_arg.get("variable"),
+                                    "direct": False,
+                                }
+                                var_info = f"via variable '{source_info['variable']}'" if source_info["variable"] else ""
+                                vuln.message = (
+                                    f"Function '{func_name}' receives tainted data from {source_info['type']} source "
+                                    f"(line {source_info['line']} in {source_info['file']}) {var_info} "
+                                    f"and performs property copying/merging without validating dangerous properties. "
+                                    f"This creates a prototype pollution vulnerability. "
+                                    f"Tainted data flows from source to sink at line {call_line} in {call_file}."
+                                )
+                            
+                            vuln.vulnerability_type = "source_to_sink_pollution"
+                            break
+    
+    def _vulnerability_matches_function(self, vuln: Vulnerability, func_name: str) -> bool:
+        """
+        Check if vulnerability is for a specific function.
+        
+        Args:
+            vuln: Vulnerability object
+            func_name: Function name to match
+            
+        Returns:
+            True if vulnerability matches function
+        """
+        # Extract function name from vulnerability message
+        if func_name.lower() in vuln.message.lower():
+            return True
+        
+        # Check code snippet
+        if func_name.lower() in vuln.code_snippet.lower():
+            return True
+        
+        return False
+    
     def _check_source_to_sink_flow(self, func_body: Any, param_names: List[str], ast: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Check if source data flows to sinks in the function.
@@ -622,31 +1037,28 @@ class PrototypePollutionAnalyzer:
         Returns:
             Source information if flow detected, None otherwise
         """
-        # Check if any parameter comes from a known source
+        # Check if any parameter is tainted
         for param_name in param_names:
-            if param_name in self.data_flow:
-                source_types = self.data_flow[param_name]
-                # Find the source details
-                for source in self.sources:
-                    if source.get("variable") == param_name or source.get("type") in source_types:
-                        return {
-                            "type": source.get("type", "unknown"),
-                            "line": source.get("line"),
-                            "variable": param_name,
-                        }
+            if param_name in self.tainted_vars:
+                taint_info = self.tainted_vars[param_name]
+                return {
+                    "type": taint_info.get("source_type", "unknown"),
+                    "line": taint_info.get("source_line"),
+                    "file": taint_info.get("source_file"),
+                    "variable": param_name,
+                }
         
-        # Check if function body uses variables that come from sources
+        # Check if function body uses tainted variables
         used_vars = self._extract_variable_usage(func_body)
         for var_name in used_vars:
-            if var_name in self.data_flow:
-                source_types = self.data_flow[var_name]
-                for source in self.sources:
-                    if source.get("variable") == var_name or source.get("type") in source_types:
-                        return {
-                            "type": source.get("type", "unknown"),
-                            "line": source.get("line"),
-                            "variable": var_name,
-                        }
+            if var_name in self.tainted_vars:
+                taint_info = self.tainted_vars[var_name]
+                return {
+                    "type": taint_info.get("source_type", "unknown"),
+                    "line": taint_info.get("source_line"),
+                    "file": taint_info.get("source_file"),
+                    "variable": var_name,
+                }
         
         return None
     
@@ -688,13 +1100,39 @@ class PrototypePollutionAnalyzer:
         
         return list(set(used_vars))  # Remove duplicates
     
+    def _add_vuln(self, *, severity: str, line: int, column: int, message: str,
+                  code_snippet: str, vulnerability_type: str, file: str) -> None:
+        """
+        Add vulnerability with deduplication.
+        
+        Args:
+            severity: Vulnerability severity
+            line: Line number
+            column: Column number
+            message: Vulnerability message
+            code_snippet: Code snippet
+            vulnerability_type: Type of vulnerability
+            file: File path
+        """
+        key = (file or "", int(line or 0), int(column or 0), vulnerability_type or "")
+        if key in self._seen_vulns:
+            return
+        self._seen_vulns.add(key)
+        self.vulnerabilities.append(Vulnerability(
+            severity=severity,
+            line=line,
+            column=column,
+            message=message,
+            code_snippet=code_snippet,
+            vulnerability_type=vulnerability_type,
+            file=file
+        ))
+    
     def _find_prototype_pollution_sinks(self, node: Any, func_name: str) -> Dict[str, Any]:
         """
         Find prototype pollution sinks in AST nodes using semantic analysis.
         
-        Sinks are dangerous operations where user-controlled data flows:
-        - Property assignments: obj[key] = value
-        - Object.assign calls
+        Better sink/guard analysis: only marks actual writes as sinks, recognizes guards.
         
         Args:
             node: AST node to analyze
@@ -713,70 +1151,205 @@ class PrototypePollutionAnalyzer:
         if not isinstance(node, dict):
             return result
         
-        node_type = node.get("type")
+        ntype = node.get("type")
         
-        # Check for property assignment sinks
-        if node_type == "AssignmentExpression":
+        # 1) Property write: target[key] = value
+        if ntype == "AssignmentExpression":
             left = node.get("left", {})
             if left.get("type") == "MemberExpression":
-                # Check if this is a property assignment: obj[key] = value
-                # This is a sink if:
-                # 1. The property is accessed via computed property (obj[key])
-                # 2. Or it's a direct dangerous property assignment
                 computed = left.get("computed", False)
-                prop_name = self._get_property_name_from_ast(left)
                 
-                if computed:
-                    # obj[key] = value - this is a sink (key comes from variable)
+                # Direct dangerous prop write: target.__proto__ = ...
+                if not computed:
+                    pname = self._get_property_name_from_ast(left)
+                    if pname and pname in self.DANGEROUS_PROPERTIES:
+                        result["has_sink"] = True
+                        guards = self._is_guarded(node, key_name=None)  # direct name, no key var
+                        result["has_validation"] = guards["full"]
+                        result["has_partial_validation"] = guards["partial"]
+                else:
+                    # target[key] = ...
+                    # Try to get the key identifier for guard correlation
+                    key_node = left.get("property", {})
+                    key_name = key_node.get("name") if key_node.get("type") == "Identifier" else None
                     result["has_sink"] = True
-                elif prop_name and prop_name in self.DANGEROUS_PROPERTIES:
-                    # Direct dangerous property assignment
-                    result["has_sink"] = True
+                    guards = self._is_guarded(node, key_name=key_name)
+                    result["has_validation"] = guards["full"]
+                    result["has_partial_validation"] = guards["partial"]
         
-        # Check for Object.assign sinks
-        elif node_type == "CallExpression":
+        # 2) Call-based sinks
+        elif ntype == "CallExpression":
             callee = node.get("callee", {})
             callee_name = self._get_function_name_from_ast(callee)
             
-            if callee_name == "Object.assign":
+            if callee_name in self.SINK_CALLEES:
                 result["has_sink"] = True
+                
+                # Lower severity if assigning into fresh null-proto target: Object.assign(Object.create(null), src)
+                if callee_name == "Object.assign":
+                    args = node.get("arguments", [])
+                    if args and args[0].get("type") == "CallExpression":
+                        c2 = args[0].get("callee", {})
+                        if self._get_function_name_from_ast(c2) in self.SAFE_TARGET_CREATORS:
+                            # Treated as validated because prototype is null
+                            result["has_validation"] = True
             
-            # Check for recursive function calls
+            # Recursive call to same function (deep merge)
             if callee_name == func_name:
                 result["is_recursive"] = True
+            
+            # Library helpers (extend/merge-like): treat as sink
+            if not result["has_sink"] and callee_name:
+                last = callee_name.split(".")[-1]
+                if last in self.MERGE_NAME_HINTS:
+                    result["has_sink"] = True
         
-        # Check for for...in loops (common in merge functions)
-        elif node_type == "ForInStatement":
-            # For...in loops are sinks when combined with property assignments
-            result["has_sink"] = True
+        # Note: We do NOT treat ForInStatement as a sink by itself; the write inside is the sink.
         
-        # Check for validation patterns in AST
-        validation_check = self._check_validation_in_ast(node)
-        if validation_check["has_full_validation"]:
-            result["has_validation"] = True
-        elif validation_check["has_partial_validation"]:
-            result["has_partial_validation"] = True
-        
-        # Recursively analyze children
+        # Recurse and aggregate
         for key, value in node.items():
             if key in ("loc", "range", "leadingComments", "trailingComments"):
                 continue
             if isinstance(value, dict):
-                child_result = self._find_prototype_pollution_sinks(value, func_name)
-                result["has_sink"] = result["has_sink"] or child_result["has_sink"]
-                result["has_validation"] = result["has_validation"] or child_result["has_validation"]
-                result["has_partial_validation"] = result["has_partial_validation"] or child_result["has_partial_validation"]
-                result["is_recursive"] = result["is_recursive"] or child_result["is_recursive"]
+                child = self._find_prototype_pollution_sinks(value, func_name)
+                result["has_sink"] |= child["has_sink"]
+                result["has_validation"] |= child["has_validation"]
+                result["has_partial_validation"] |= child["has_partial_validation"]
+                result["is_recursive"] |= child["is_recursive"]
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
-                        child_result = self._find_prototype_pollution_sinks(item, func_name)
-                        result["has_sink"] = result["has_sink"] or child_result["has_sink"]
-                        result["has_validation"] = result["has_validation"] or child_result["has_validation"]
-                        result["has_partial_validation"] = result["has_partial_validation"] or child_result["has_partial_validation"]
-                        result["is_recursive"] = result["is_recursive"] or child_result["is_recursive"]
+                        child = self._find_prototype_pollution_sinks(item, func_name)
+                        result["has_sink"] |= child["has_sink"]
+                        result["has_validation"] |= child["has_validation"]
+                        result["has_partial_validation"] |= child["has_partial_validation"]
+                        result["is_recursive"] |= child["is_recursive"]
         
         return result
+    
+    def _is_guarded(self, sink_node: Dict[str, Any], key_name: Optional[str]) -> Dict[str, bool]:
+        """
+        Walk ancestors and determine whether the sink is dominated by:
+        - A full exclusion check: key !== "__proto__" && key !== "constructor" && key !== "prototype"
+        - Or an own-property check: foo.hasOwnProperty(key) OR Object.prototype.hasOwnProperty.call(foo, key)
+        
+        Returns {"full": bool, "partial": bool}
+        
+        Args:
+            sink_node: Sink node (AssignmentExpression)
+            key_name: Name of the key variable (if known)
+            
+        Returns:
+            Dictionary with guard information
+        """
+        full = False
+        partial = False
+        cur = sink_node
+        seen = set()
+        
+        while cur and id(cur) not in seen:
+            seen.add(id(cur))
+            parent = self.parent_map.get(id(cur))
+            if not parent:
+                break
+            
+            ptype = parent.get("type")
+            
+            if ptype == "IfStatement":
+                test = parent.get("test", {})
+                excl = self._collect_dangerous_exclusions(test, key_name)
+                if excl == self.DANGEROUS_PROPERTIES:
+                    full = True
+                elif excl:
+                    partial = True
+                
+                if self._if_test_has_hasOwnProperty(test, key_name):
+                    # hasOwnProperty guard is considered full (prevents proto chain keys)
+                    full = True
+            
+            cur = parent
+        
+        return {"full": full, "partial": partial}
+    
+    def _collect_dangerous_exclusions(self, test_node: Dict[str, Any], key_name: Optional[str]) -> Set[str]:
+        """
+        Return the subset of dangerous props excluded by a test of the form:
+        key !== "__proto__" && key !== "constructor" && key !== "prototype"
+        or the negated form inside an if-branch that skips/continues.
+        
+        Args:
+            test_node: Test expression node
+            key_name: Name of the key variable (if known)
+            
+        Returns:
+            Set of dangerous properties that are excluded
+        """
+        found: Set[str] = set()
+        if not isinstance(test_node, dict):
+            return found
+        
+        ntype = test_node.get("type")
+        if ntype == "BinaryExpression":
+            op = test_node.get("operator")
+            left = test_node.get("left", {})
+            right = test_node.get("right", {})
+            
+            # Normalize (Identifier === Literal) or (Literal === Identifier)
+            ident = left if left.get("type") == "Identifier" else (right if right.get("type") == "Identifier" else None)
+            lit = right if right.get("type") == "Literal" else (left if left.get("type") == "Literal" else None)
+            
+            if ident and lit:
+                if key_name is None or ident.get("name") == key_name:
+                    val = str(lit.get("value"))
+                    if val in self.DANGEROUS_PROPERTIES:
+                        # For !== or != we consider it exclusion (safe path)
+                        if op in ("!==", "!="):
+                            found.add(val)
+        elif ntype == "LogicalExpression":
+            # Collect across AND/OR
+            found |= self._collect_dangerous_exclusions(test_node.get("left", {}), key_name)
+            found |= self._collect_dangerous_exclusions(test_node.get("right", {}), key_name)
+        
+        return found
+    
+    def _if_test_has_hasOwnProperty(self, test_node: Dict[str, Any], key_name: Optional[str]) -> bool:
+        """
+        Detect hasOwnProperty guards in an if() test.
+        
+        Args:
+            test_node: Test expression node
+            key_name: Name of the key variable (if known)
+            
+        Returns:
+            True if hasOwnProperty guard is detected
+        """
+        if not isinstance(test_node, dict):
+            return False
+        
+        ntype = test_node.get("type")
+        if ntype == "CallExpression":
+            callee = test_node.get("callee", {})
+            args = test_node.get("arguments", [])
+            name = self._get_function_name_from_ast(callee)
+            
+            # obj.hasOwnProperty(key)
+            if name and name.endswith(".hasOwnProperty") and args:
+                return (key_name is None) or (args[0].get("type") == "Identifier" and args[0].get("name") == key_name)
+            
+            # Object.prototype.hasOwnProperty.call(obj, key)
+            if name == "Object.prototype.hasOwnProperty.call" and len(args) >= 2:
+                return (key_name is None) or (args[1].get("type") == "Identifier" and args[1].get("name") == key_name)
+        elif ntype in ("LogicalExpression", "BinaryExpression"):
+            return (self._if_test_has_hasOwnProperty(test_node.get("left", {}), key_name) or
+                    self._if_test_has_hasOwnProperty(test_node.get("right", {}), key_name))
+        elif ntype == "UnaryExpression":
+            return self._if_test_has_hasOwnProperty(test_node.get("argument", {}), key_name)
+        elif ntype == "ConditionalExpression":
+            return (self._if_test_has_hasOwnProperty(test_node.get("test", {}), key_name) or
+                    self._if_test_has_hasOwnProperty(test_node.get("consequent", {}), key_name) or
+                    self._if_test_has_hasOwnProperty(test_node.get("alternate", {}), key_name))
+        
+        return False
     
     def _get_property_name_from_ast(self, member_expr: Dict[str, Any]) -> Optional[str]:
         """
