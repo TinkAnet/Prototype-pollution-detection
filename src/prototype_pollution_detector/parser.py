@@ -419,6 +419,7 @@ class JavaScriptParser:
                     "line": node.get("loc", {}).get("start", {}).get("line"),
                     "column": node.get("loc", {}).get("start", {}).get("column"),
                     "body": self._get_code_snippet(func_body, code) if func_body else "",
+                    "ast_node": node,  # Include full AST node for semantic analysis
                 }
                 result["functions"].append(func_info)
             
@@ -431,6 +432,7 @@ class JavaScriptParser:
                     "line": node.get("loc", {}).get("start", {}).get("line"),
                     "column": node.get("loc", {}).get("start", {}).get("column"),
                     "body": self._get_code_snippet(func_body, code) if func_body else "",
+                    "ast_node": node,  # Include full AST node for semantic analysis
                 }
                 result["functions"].append(func_info)
             
@@ -594,7 +596,10 @@ class JavaScriptParser:
     
     def _parse_code_regex(self, code: str, result: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Fallback parsing using regex when esprima is not available.
+        Minimal fallback parsing when esprima is not available.
+        
+        Note: This only extracts minimal information. Full semantic analysis
+        requires AST parsing and will not be available when using this fallback.
         
         Args:
             code: JavaScript code
@@ -603,21 +608,9 @@ class JavaScriptParser:
         Returns:
             Updated result dictionary
         """
-        # Extract function declarations
-        func_pattern = r'function\s+(\w+)\s*\('
-        for match in re.finditer(func_pattern, code):
-            result["functions"].append({
-                "name": match.group(1),
-                "line": code[:match.start()].count("\n") + 1,
-            })
-        
-        # Extract JSON.parse calls
-        json_parse_pattern = r'JSON\.parse\s*\('
-        for match in re.finditer(json_parse_pattern, code):
-            result["json_parse_calls"].append({
-                "line": code[:match.start()].count("\n") + 1,
-                "code": code[max(0, match.start()-20):match.end()+50],
-            })
+        # Minimal extraction - no regex-based analysis
+        # Just mark that AST parsing failed
+        result["parse_error"] = "esprima not available - AST parsing required for semantic analysis"
         
         return result
     

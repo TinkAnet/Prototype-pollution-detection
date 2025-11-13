@@ -3,11 +3,10 @@ Analysis module for detecting prototype pollution patterns.
 
 This module contains the core logic for analyzing parsed JavaScript code
 and HTML files to identify potential prototype pollution vulnerabilities.
+Uses semantic AST analysis instead of regex pattern matching.
 """
 
-import json
-import re
-from typing import Dict, List, Any, Set, Optional
+from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 
 
@@ -102,65 +101,10 @@ class PrototypePollutionAnalyzer:
                     script_ast = parser.parse_code(script_content, ast.get("file", ""))
                     self._analyze_javascript_code(script_ast)
                 except Exception:
-                    # If parsing fails, try to extract functions via regex
-                    self._extract_functions_from_code(script_content, script_tag.get("line", 0))
+                    # If parsing fails, skip this script (no regex fallback)
+                    if self.verbose:
+                        print(f"Warning: Could not parse script tag at line {script_tag.get('line', 'unknown')}")
     
-    def _extract_functions_from_code(self, code: str, start_line: int = 0) -> None:
-        """
-        Extract function definitions from raw code using regex.
-        
-        Used as fallback when AST parsing fails.
-        
-        Args:
-            code: JavaScript code string
-            start_line: Starting line number
-        """
-        if start_line is None or not isinstance(start_line, int):
-            start_line = 0
-        
-        # Pattern to find function declarations: function name(...) { ... }
-        func_pattern = r'function\s+(\w+)\s*\([^)]*\)\s*\{([^}]*)\}'
-        for match in re.finditer(func_pattern, code, re.IGNORECASE | re.DOTALL):
-            func_name = match.group(1)
-            func_body = match.group(2)
-            line_num = start_line + code[:match.start()].count("\n")
-            
-            # Check if this function does property copying
-            if self._has_property_copying_pattern(func_body):
-                # Check if it validates
-                has_validation = self._has_property_validation(func_body)
-                
-                if not has_validation:
-                    self.vulnerabilities.append(Vulnerability(
-                        severity="high",
-                        line=line_num,
-                        column=0,
-                        message=(
-                            f"Function '{func_name}' performs property copying/merging "
-                            f"without validating dangerous properties. This makes it vulnerable "
-                            f"to prototype pollution attacks."
-                        ),
-                        code_snippet=match.group(0)[:300],
-                        vulnerability_type="vulnerable_property_copying",
-                    ))
-    
-    def _has_property_copying_pattern(self, code: str) -> bool:
-        """
-        Check if code contains recursive merge patterns.
-        
-        Args:
-            code: Code string to check
-            
-        Returns:
-            True if recursive merge pattern is found
-        """
-        # Check for recursive merge indicators
-        patterns = [
-            r'for\s*\([^)]*\s+in\s+[^)]*\)',  # for...in loop
-            r'typeof\s+[^=]+\s*===\s*["\']object["\']',  # Type checking
-            r'\[[^\]]+\]\s*=\s*',  # Property assignment
-        ]
-        return any(re.search(pattern, code, re.IGNORECASE) for pattern in patterns)
     
     def _analyze_javascript_code(self, ast: Dict[str, Any]) -> None:
         """
@@ -197,7 +141,7 @@ class PrototypePollutionAnalyzer:
     
     def _check_function_vulnerability(self, func: Dict[str, Any], ast: Dict[str, Any]) -> None:
         """
-        Check if a function's logic is vulnerable to prototype pollution.
+        Check if a function's logic is vulnerable to prototype pollution using semantic AST analysis.
         
         Focus: Detects recursive/deep merge functions that are vulnerable.
         Prototype pollution typically occurs in recursive merge functions that
@@ -208,217 +152,366 @@ class PrototypePollutionAnalyzer:
             ast: Full AST dictionary
         """
         func_name = func.get("name", "") or ""
-        func_body = func.get("body", "")
         func_line = func.get("line", 0) or 0
         func_column = func.get("column", 0) or 0
         
-        if not func_body:
+        # Get the function's AST node if available
+        func_ast = func.get("ast_node")
+        if not func_ast:
+            # Try to find function in main AST
+            func_ast = self._find_function_in_ast(ast, func_name, func_line)
+        
+        if not func_ast:
             return
         
-        # Focus on recursive/deep merge patterns - these are the main source of prototype pollution
-        is_recursive_merge = self._is_recursive_merge_function(func_name, func_body, ast)
+        # Analyze function semantically using AST
+        analysis_result = self._analyze_function_ast(func_ast, func_name)
         
-        if is_recursive_merge:
-            # Check if function validates dangerous properties
-            has_validation = self._has_property_validation(func_body)
+        if analysis_result["is_vulnerable"]:
+            func_display_name = func_name if func_name else "(anonymous)"
+            severity = analysis_result.get("severity", "high")
+            message = analysis_result.get("message", 
+                f"Function '{func_display_name}' is vulnerable to prototype pollution.")
+            
+            code_snippet = func.get("body", "")[:300] if func.get("body") else ""
+            
+            self.vulnerabilities.append(Vulnerability(
+                severity=severity,
+                line=func_line,
+                column=func_column,
+                message=message,
+                code_snippet=code_snippet,
+                vulnerability_type=analysis_result.get("vulnerability_type", "vulnerable_function"),
+            ))
+    
+    def _find_function_in_ast(self, ast: Dict[str, Any], func_name: str, line: int) -> Optional[Dict[str, Any]]:
+        """
+        Find a function node in the AST by name and line number.
+        
+        Args:
+            ast: AST dictionary
+            func_name: Function name
+            line: Line number
+            
+        Returns:
+            Function AST node or None
+        """
+        ast_root = ast.get("ast")
+        if not ast_root:
+            return None
+        
+        return self._traverse_ast_for_function(ast_root, func_name, line)
+    
+    def _traverse_ast_for_function(self, node: Any, func_name: str, line: int) -> Optional[Dict[str, Any]]:
+        """
+        Traverse AST to find a function node.
+        
+        Args:
+            node: AST node
+            func_name: Function name to find
+            line: Line number
+            
+        Returns:
+            Function node or None
+        """
+        if not isinstance(node, dict):
+            return None
+        
+        node_type = node.get("type")
+        node_line = node.get("loc", {}).get("start", {}).get("line")
+        
+        if node_type in ("FunctionDeclaration", "FunctionExpression"):
+            func_id = node.get("id", {})
+            if func_id and func_id.get("name") == func_name:
+                if node_line == line or line == 0:
+                    return node
+        
+        # Recursively search children
+        for key, value in node.items():
+            if key in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(value, dict):
+                result = self._traverse_ast_for_function(value, func_name, line)
+                if result:
+                    return result
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        result = self._traverse_ast_for_function(item, func_name, line)
+                        if result:
+                            return result
+        
+        return None
+    
+    def _analyze_function_ast(self, func_node: Dict[str, Any], func_name: str) -> Dict[str, Any]:
+        """
+        Semantically analyze a function AST node for prototype pollution vulnerabilities.
+        
+        This method detects sinks (dangerous operations) by analyzing AST structure:
+        - Property assignments (MemberExpression with AssignmentExpression)
+        - For...in loops that iterate over object properties
+        - Recursive function calls
+        - Object.assign calls
+        
+        Args:
+            func_node: Function AST node
+            func_name: Function name
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        result = {
+            "is_vulnerable": False,
+            "severity": "low",
+            "message": "",
+            "vulnerability_type": "",
+        }
+        
+        func_body = func_node.get("body", {})
+        if not func_body:
+            return result
+        
+        # Analyze function body semantically
+        sink_analysis = self._find_prototype_pollution_sinks(func_body, func_name)
+        
+        if sink_analysis["has_sink"]:
+            has_validation = sink_analysis["has_validation"]
+            is_recursive = sink_analysis["is_recursive"]
             
             if not has_validation:
-                # This recursive merge function is vulnerable!
-                func_display_name = func_name if func_name else "(anonymous)"
-                self.vulnerabilities.append(Vulnerability(
-                    severity="high",
-                    line=func_line,
-                    column=func_column,
-                    message=(
-                        f"Recursive merge function '{func_display_name}' performs deep property copying "
-                        f"without validating dangerous properties (__proto__, constructor, prototype). "
-                        f"This makes it vulnerable to prototype pollution attacks."
-                    ),
-                    code_snippet=func_body[:300] if len(func_body) > 300 else func_body,
-                    vulnerability_type="vulnerable_recursive_merge",
-                ))
-            elif self._has_partial_validation(func_body):
-                # Partial validation - still potentially unsafe
-                func_display_name = func_name if func_name else "(anonymous)"
-                self.vulnerabilities.append(Vulnerability(
-                    severity="medium",
-                    line=func_line,
-                    column=func_column,
-                    message=(
-                        f"Recursive merge function '{func_display_name}' performs deep property copying "
-                        f"with partial validation. Please verify that all dangerous properties "
-                        f"are properly checked before recursive merging."
-                    ),
-                    code_snippet=func_body[:300] if len(func_body) > 300 else func_body,
-                    vulnerability_type="partially_safe_recursive_merge",
-                ))
-    
-    def _is_recursive_merge_function(self, func_name: str, func_body: str, ast: Dict[str, Any]) -> bool:
-        """
-        Check if a function is a recursive/deep merge function.
+                result["is_vulnerable"] = True
+                result["severity"] = "high"
+                result["vulnerability_type"] = "vulnerable_recursive_merge" if is_recursive else "vulnerable_property_assignment"
+                result["message"] = (
+                    f"Function '{func_name if func_name else '(anonymous)'}' performs property copying/merging "
+                    f"without validating dangerous properties (__proto__, constructor, prototype). "
+                    f"This makes it vulnerable to prototype pollution attacks."
+                )
+            elif sink_analysis["has_partial_validation"]:
+                result["is_vulnerable"] = True
+                result["severity"] = "medium"
+                result["vulnerability_type"] = "partially_safe_recursive_merge"
+                result["message"] = (
+                    f"Function '{func_name if func_name else '(anonymous)'}' performs deep property copying "
+                    f"with partial validation. Please verify that all dangerous properties "
+                    f"are properly checked before recursive merging."
+                )
         
-        Recursive merge functions are the main source of prototype pollution because
-        they traverse nested objects and can copy properties from __proto__.
+        return result
+    
+    def _find_prototype_pollution_sinks(self, node: Any, func_name: str) -> Dict[str, Any]:
+        """
+        Find prototype pollution sinks in AST nodes using semantic analysis.
+        
+        Sinks are dangerous operations where user-controlled data flows:
+        - Property assignments: obj[key] = value
+        - Object.assign calls
         
         Args:
-            func_name: Function name
-            func_body: Function body code
-            ast: Full AST dictionary
+            node: AST node to analyze
+            func_name: Function name (for detecting recursive calls)
             
         Returns:
-            True if this is a recursive merge function
+            Dictionary with sink analysis results
         """
-        # Pattern 1: Function calls itself recursively (classic recursive merge)
-        if func_name:
-            # Check if function calls itself: extend(out[key], val) or merge(target[key], source[key])
-            recursive_call_pattern = rf'\b{re.escape(func_name)}\s*\('
-            if re.search(recursive_call_pattern, func_body, re.IGNORECASE):
-                # Also check if it's merging nested objects
-                if self._has_nested_object_merge_pattern(func_body):
-                    return True
+        result = {
+            "has_sink": False,
+            "has_validation": False,
+            "has_partial_validation": False,
+            "is_recursive": False,
+        }
         
-        # Pattern 2: Deep merge pattern - checks if value is object and merges recursively
-        # e.g., if (typeof val === 'object') { merge(target[key], val); }
-        deep_merge_patterns = [
-            r'typeof\s+[^=]+\s*===\s*["\']object["\']',
-            r'typeof\s+[^=]+\s*==\s*["\']object["\']',
-            r'val\s*!=\s*null\s*&&\s*typeof\s+val\s*===\s*["\']object["\']',
-            r'Array\.isArray\s*\(',
-        ]
+        if not isinstance(node, dict):
+            return result
         
-        has_type_check = any(
-            re.search(pattern, func_body, re.IGNORECASE)
-            for pattern in deep_merge_patterns
-        )
+        node_type = node.get("type")
         
-        # Pattern 3: Checks for nested objects and then does recursive assignment
-        # e.g., if (out[key] != null && typeof out[key] === 'object') { extend(out[key], val); }
-        has_nested_merge = self._has_nested_object_merge_pattern(func_body)
+        # Check for property assignment sinks
+        if node_type == "AssignmentExpression":
+            left = node.get("left", {})
+            if left.get("type") == "MemberExpression":
+                # Check if this is a property assignment: obj[key] = value
+                # This is a sink if:
+                # 1. The property is accessed via computed property (obj[key])
+                # 2. Or it's a direct dangerous property assignment
+                computed = left.get("computed", False)
+                prop_name = self._get_property_name_from_ast(left)
+                
+                if computed:
+                    # obj[key] = value - this is a sink (key comes from variable)
+                    result["has_sink"] = True
+                elif prop_name and prop_name in self.DANGEROUS_PROPERTIES:
+                    # Direct dangerous property assignment
+                    result["has_sink"] = True
         
-        # Pattern 4: Uses Object.assign or spread with nested object handling
-        has_object_assign_with_nesting = (
-            'Object.assign' in func_body and
-            ('typeof' in func_body or 'Array.isArray' in func_body)
-        )
+        # Check for Object.assign sinks
+        elif node_type == "CallExpression":
+            callee = node.get("callee", {})
+            callee_name = self._get_function_name_from_ast(callee)
+            
+            if callee_name == "Object.assign":
+                result["has_sink"] = True
+            
+            # Check for recursive function calls
+            if callee_name == func_name:
+                result["is_recursive"] = True
         
-        # Pattern 5: for...in loop with recursive property copying
-        # This is the classic vulnerable pattern: for (key in source) { if (isObject) { recursiveMerge(); } else { assign(); } }
-        has_for_in_with_recursion = bool(
-            re.search(r'for\s*\([^)]*\s+in\s+[^)]*\)', func_body, re.IGNORECASE) and
-            has_type_check and
-            re.search(r'\[[^\]]+\]\s*=\s*', func_body)
-        )
+        # Check for for...in loops (common in merge functions)
+        elif node_type == "ForInStatement":
+            # For...in loops are sinks when combined with property assignments
+            result["has_sink"] = True
         
-        # Must have property copying AND recursive/nested handling
-        has_property_copying = bool(
-            re.search(r'\[[^\]]+\]\s*=\s*', func_body) or
-            'Object.assign' in func_body or
-            re.search(r'for\s*\([^)]*\s+in\s+[^)]*\)', func_body, re.IGNORECASE)
-        )
+        # Check for validation patterns in AST
+        validation_check = self._check_validation_in_ast(node)
+        if validation_check["has_full_validation"]:
+            result["has_validation"] = True
+        elif validation_check["has_partial_validation"]:
+            result["has_partial_validation"] = True
         
-        # Return true if it has recursive merge characteristics
-        return (
-            (has_for_in_with_recursion) or
-            (has_nested_merge and has_property_copying) or
-            (has_object_assign_with_nesting and has_property_copying) or
-            (has_type_check and has_property_copying and 'for' in func_body.lower())
-        )
+        # Recursively analyze children
+        for key, value in node.items():
+            if key in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(value, dict):
+                child_result = self._find_prototype_pollution_sinks(value, func_name)
+                result["has_sink"] = result["has_sink"] or child_result["has_sink"]
+                result["has_validation"] = result["has_validation"] or child_result["has_validation"]
+                result["has_partial_validation"] = result["has_partial_validation"] or child_result["has_partial_validation"]
+                result["is_recursive"] = result["is_recursive"] or child_result["is_recursive"]
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        child_result = self._find_prototype_pollution_sinks(item, func_name)
+                        result["has_sink"] = result["has_sink"] or child_result["has_sink"]
+                        result["has_validation"] = result["has_validation"] or child_result["has_validation"]
+                        result["has_partial_validation"] = result["has_partial_validation"] or child_result["has_partial_validation"]
+                        result["is_recursive"] = result["is_recursive"] or child_result["is_recursive"]
+        
+        return result
     
-    def _has_nested_object_merge_pattern(self, func_body: str) -> bool:
+    def _get_property_name_from_ast(self, member_expr: Dict[str, Any]) -> Optional[str]:
         """
-        Check if function has patterns that indicate nested object merging.
+        Extract property name from a MemberExpression AST node.
         
         Args:
-            func_body: Function body code
+            member_expr: MemberExpression AST node
             
         Returns:
-            True if nested object merge pattern is found
+            Property name or None
         """
-        patterns = [
-            # Pattern: if (target[key] != null && typeof target[key] === 'object') { merge(); }
-            r'\[[^\]]+\]\s*!=\s*null',
-            r'typeof\s+[^=]+\s*\[[^\]]+\]\s*===\s*["\']object["\']',
-            # Pattern: Recursive call with nested property access
-            r'\w+\s*\([^)]*\[[^\]]+\][^)]*\)',
-            # Pattern: Deep copy/merge indicators
-            r'deep',
-            r'recursive',
-        ]
+        if member_expr.get("type") != "MemberExpression":
+            return None
         
-        return any(
-            re.search(pattern, func_body, re.IGNORECASE)
-            for pattern in patterns
-        )
+        prop = member_expr.get("property", {})
+        if prop.get("type") == "Identifier":
+            return prop.get("name")
+        elif prop.get("type") == "Literal":
+            return str(prop.get("value"))
+        
+        return None
     
-    def _has_property_validation(self, func_body: str) -> bool:
+    def _get_function_name_from_ast(self, callee: Dict[str, Any]) -> Optional[str]:
         """
-        Check if function body validates dangerous properties.
+        Extract function name from a CallExpression callee AST node.
         
         Args:
-            func_body: Function body code
+            callee: Callee AST node
             
         Returns:
-            True if validation is present
+            Function name or None
         """
-        validation_patterns = [
-            # Explicit checks for dangerous properties
-            r'key\s*[!=]==\s*["\']__proto__["\']',
-            r'key\s*[!=]==\s*["\']constructor["\']',
-            r'key\s*[!=]==\s*["\']prototype["\']',
-            r'["\']__proto__["\']\s*[!=]==\s*key',
-            r'["\']constructor["\']\s*[!=]==\s*key',
-            r'["\']prototype["\']\s*[!=]==\s*key',
-            # hasOwnProperty checks
-            r'hasOwnProperty\s*\(\s*["\']__proto__["\']',
-            r'hasOwnProperty\s*\(\s*["\']constructor["\']',
-            r'hasOwnProperty\s*\(\s*["\']prototype["\']',
-            # Object.prototype checks
-            r'Object\.prototype\.hasOwnProperty',
-            # Dangerous properties arrays/sets
-            r'DANGEROUS_PROPERTIES',
-            r'dangerousProperties',
-            r'__proto__.*constructor.*prototype',
-            # Continue/return statements that skip dangerous properties
-            r'if\s*\([^)]*(?:__proto__|constructor|prototype)[^)]*\)\s*(?:continue|return)',
-        ]
+        if callee.get("type") == "Identifier":
+            return callee.get("name")
+        elif callee.get("type") == "MemberExpression":
+            obj = callee.get("object", {})
+            prop = callee.get("property", {})
+            if obj.get("type") == "Identifier" and prop.get("type") == "Identifier":
+                return f"{obj.get('name')}.{prop.get('name')}"
         
-        return any(
-            re.search(pattern, func_body, re.IGNORECASE)
-            for pattern in validation_patterns
-        )
+        return None
     
-    def _has_partial_validation(self, func_body: str) -> bool:
+    def _check_validation_in_ast(self, node: Any) -> Dict[str, bool]:
         """
-        Check if function has partial validation (checks some but not all dangerous properties).
+        Check if AST node contains validation for dangerous properties.
         
         Args:
-            func_body: Function body code
+            node: AST node to check
             
         Returns:
-            True if partial validation is present
+            Dictionary with validation check results
         """
-        # Check if it validates at least one dangerous property but not all
-        checks_proto = bool(re.search(r'__proto__', func_body, re.IGNORECASE))
-        checks_constructor = bool(re.search(r'constructor', func_body, re.IGNORECASE))
-        checks_prototype = bool(re.search(r'\bprototype\b', func_body, re.IGNORECASE))
+        result = {
+            "has_full_validation": False,
+            "has_partial_validation": False,
+        }
         
-        # If it checks at least one but not all three, it's partial
-        checked_count = sum([checks_proto, checks_constructor, checks_prototype])
-        return 1 <= checked_count < 3
+        if not isinstance(node, dict):
+            return result
+        
+        node_type = node.get("type")
+        
+        # Check for binary expressions comparing to dangerous properties
+        if node_type == "BinaryExpression":
+            operator = node.get("operator")
+            if operator in ("===", "!==", "==", "!="):
+                left = node.get("left", {})
+                right = node.get("right", {})
+                
+                # Check if comparing to dangerous property string
+                left_val = self._get_string_value_from_ast(left)
+                right_val = self._get_string_value_from_ast(right)
+                
+                dangerous_found = []
+                for prop in self.DANGEROUS_PROPERTIES:
+                    if prop in (left_val, right_val):
+                        dangerous_found.append(prop)
+                
+                if len(dangerous_found) == len(self.DANGEROUS_PROPERTIES):
+                    result["has_full_validation"] = True
+                elif len(dangerous_found) > 0:
+                    result["has_partial_validation"] = True
+        
+        # Check for CallExpression to hasOwnProperty
+        elif node_type == "CallExpression":
+            callee = node.get("callee", {})
+            callee_name = self._get_function_name_from_ast(callee)
+            if "hasOwnProperty" in (callee_name or ""):
+                result["has_full_validation"] = True
+        
+        # Recursively check children
+        for key, value in node.items():
+            if key in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(value, dict):
+                child_result = self._check_validation_in_ast(value)
+                result["has_full_validation"] = result["has_full_validation"] or child_result["has_full_validation"]
+                result["has_partial_validation"] = result["has_partial_validation"] or child_result["has_partial_validation"]
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        child_result = self._check_validation_in_ast(item)
+                        result["has_full_validation"] = result["has_full_validation"] or child_result["has_full_validation"]
+                        result["has_partial_validation"] = result["has_partial_validation"] or child_result["has_partial_validation"]
+        
+        return result
     
-    
-    def check_property_assignment(self, node: Dict[str, Any]) -> bool:
+    def _get_string_value_from_ast(self, node: Dict[str, Any]) -> Optional[str]:
         """
-        Check if a property assignment is potentially dangerous.
+        Extract string value from AST node.
         
         Args:
-            node: AST node representing a property assignment
+            node: AST node
             
         Returns:
-            True if the assignment is potentially dangerous
+            String value or None
         """
-        prop_name = node.get("property", "")
-        return prop_name in self.DANGEROUS_PROPERTIES
+        if node.get("type") == "Literal":
+            return str(node.get("value", ""))
+        elif node.get("type") == "Identifier":
+            return node.get("name")
+        
+        return None
+    
     
     def get_vulnerability_report(self) -> Dict[str, Any]:
         """
