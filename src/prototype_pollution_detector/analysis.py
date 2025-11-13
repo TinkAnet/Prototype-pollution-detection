@@ -278,7 +278,8 @@ class PrototypePollutionAnalyzer:
         if not ast_root:
             return
         
-        self._find_sources_in_ast(ast_root)
+        filename = ast.get("file", "unknown")
+        self._find_sources_in_ast(ast_root, None, filename)
         
         # Also check json_parse_calls extracted by parser
         for json_call in ast.get("json_parse_calls", []):
@@ -288,9 +289,10 @@ class PrototypePollutionAnalyzer:
                 "column": json_call.get("column"),
                 "code": json_call.get("code", ""),
                 "variable": None,  # Will be extracted from AST
+                "file": filename,
             })
     
-    def _find_sources_in_ast(self, node: Any, parent: Optional[Any] = None) -> None:
+    def _find_sources_in_ast(self, node: Any, parent: Optional[Any] = None, filename: str = "unknown") -> None:
         """
         Recursively find source nodes in AST.
         
@@ -315,6 +317,7 @@ class PrototypePollutionAnalyzer:
                     "line": node.get("loc", {}).get("start", {}).get("line"),
                     "column": node.get("loc", {}).get("start", {}).get("column"),
                     "variable": variable_name,
+                    "file": filename,
                     "node": node,
                 }
                 self.sources.append(source_info)
@@ -328,6 +331,7 @@ class PrototypePollutionAnalyzer:
                     "column": node.get("loc", {}).get("start", {}).get("column"),
                     "variable": variable_name,
                     "method": callee_name,
+                    "file": filename,
                     "node": node,
                 }
                 self.sources.append(source_info)
@@ -342,6 +346,7 @@ class PrototypePollutionAnalyzer:
                         "column": node.get("loc", {}).get("start", {}).get("column"),
                         "variable": variable_name,
                         "method": callee_name,
+                        "file": filename,
                         "node": node,
                     }
                     self.sources.append(source_info)
@@ -360,6 +365,7 @@ class PrototypePollutionAnalyzer:
                         "variable": variable_name,
                         "property": prop_name,
                         "object": obj_name,
+                        "file": filename,
                         "node": node,
                     }
                     self.sources.append(source_info)
@@ -369,11 +375,11 @@ class PrototypePollutionAnalyzer:
             if key in ("loc", "range", "leadingComments", "trailingComments"):
                 continue
             if isinstance(value, dict):
-                self._find_sources_in_ast(value, node)
+                self._find_sources_in_ast(value, node, filename)
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
-                        self._find_sources_in_ast(item, node)
+                        self._find_sources_in_ast(item, node, filename)
     
     def _get_assigned_variable(self, node: Any, parent: Optional[Any] = None) -> Optional[str]:
         """
@@ -877,6 +883,45 @@ class PrototypePollutionAnalyzer:
         if self.verbose:
             print(f"  Found {len(self.sources)} sources")
             print(f"  Found {len(self.tainted_vars)} tainted variables")
+            
+            # Print sources
+            if self.sources:
+                print("\n  Sources detected:")
+                for i, source in enumerate(self.sources, 1):
+                    var_info = f" -> variable '{source.get('variable')}'" if source.get('variable') else ""
+                    print(f"    {i}. {source.get('type', 'unknown')} at line {source.get('line', '?')} in {source.get('file', 'unknown')}{var_info}")
+            
+            # Print tainted variables
+            if self.tainted_vars:
+                print("\n  Tainted variables:")
+                for var_name, taint_info in self.tainted_vars.items():
+                    source_type = taint_info.get('source_type', 'unknown')
+                    source_line = taint_info.get('source_line', '?')
+                    source_file = taint_info.get('source_file', 'unknown')
+                    tainted_at = taint_info.get('tainted_at', 'unknown')
+                    propagated_from = taint_info.get('propagated_from')
+                    prop_info = f" (propagated from '{propagated_from}')" if propagated_from else ""
+                    print(f"    - '{var_name}': {source_type} source at line {source_line} in {source_file} ({tainted_at}){prop_info}")
+            
+            # Print function calls with tainted arguments
+            tainted_calls = [c for c in self.function_calls if c.get('tainted')]
+            if tainted_calls:
+                print("\n  Tainted function calls:")
+                for call in tainted_calls:
+                    func_name = call.get('function', 'unknown')
+                    call_line = call.get('line', '?')
+                    call_file = call.get('file', 'unknown')
+                    tainted_args = call.get('tainted_args', [])
+                    arg_info = []
+                    for arg in tainted_args:
+                        if arg.get('is_direct_source'):
+                            arg_info.append(f"direct {arg.get('source_type')} source")
+                        else:
+                            var = arg.get('variable')
+                            if var:
+                                arg_info.append(f"'{var}'")
+                    args_str = ", ".join(arg_info) if arg_info else "unknown"
+                    print(f"    - {func_name}() at line {call_line} in {call_file} receives: {args_str}")
     
     def _propagate_taint(self) -> None:
         """
