@@ -47,6 +47,8 @@ class PrototypePollutionAnalyzer:
         """
         self.verbose = verbose
         self.vulnerabilities: List[Vulnerability] = []
+        self.sources: List[Dict[str, Any]] = []  # Track data sources
+        self.data_flow: Dict[str, List[str]] = {}  # Track variable assignments
     
     def analyze_ast(self, ast: Dict[str, Any]) -> List[Vulnerability]:
         """
@@ -111,18 +113,28 @@ class PrototypePollutionAnalyzer:
         Analyze ALL functions in JavaScript code for prototype pollution vulnerabilities.
         
         Checks every function to see if its logic is vulnerable, not just functions
-        with suspicious names.
+        with suspicious names. Now includes source detection and data flow tracking.
         
         Args:
             ast: Parsed JavaScript AST dictionary
         """
-        # Analyze ALL functions, not just those with merge/extend names
+        # Reset tracking for new AST
+        self.sources = []
+        self.data_flow = {}
+        
+        # Step 1: Detect sources (JSON.parse, DOM attributes, user input)
+        self._detect_sources(ast)
+        
+        # Step 2: Track data flow (variable assignments)
+        self._track_data_flow(ast)
+        
+        # Step 3: Analyze ALL functions for vulnerabilities
         functions = ast.get("functions", [])
         for func in functions:
             # Check if this function's logic is vulnerable to prototype pollution
             self._check_function_vulnerability(func, ast)
         
-        # Check for direct dangerous property assignments
+        # Step 4: Check for direct dangerous property assignments
         assignments = ast.get("assignments", [])
         for assign in assignments:
             prop_name = assign.get("property", "")
@@ -138,6 +150,279 @@ class PrototypePollutionAnalyzer:
                     code_snippet=assign.get("code", ""),
                     vulnerability_type="direct_dangerous_property_assignment",
                 ))
+    
+    def _detect_sources(self, ast: Dict[str, Any]) -> None:
+        """
+        Detect data sources that could contain user-controlled input.
+        
+        Sources include:
+        - JSON.parse() calls
+        - DOM attribute parsing (getAttribute, dataset, etc.)
+        - User input handling (form inputs, etc.)
+        
+        Args:
+            ast: Parsed AST dictionary
+        """
+        ast_root = ast.get("ast")
+        if not ast_root:
+            return
+        
+        self._find_sources_in_ast(ast_root)
+        
+        # Also check json_parse_calls extracted by parser
+        for json_call in ast.get("json_parse_calls", []):
+            self.sources.append({
+                "type": "json_parse",
+                "line": json_call.get("line"),
+                "column": json_call.get("column"),
+                "code": json_call.get("code", ""),
+                "variable": None,  # Will be extracted from AST
+            })
+    
+    def _find_sources_in_ast(self, node: Any) -> None:
+        """
+        Recursively find source nodes in AST.
+        
+        Args:
+            node: AST node to analyze
+        """
+        if not isinstance(node, dict):
+            return
+        
+        node_type = node.get("type")
+        
+        # Detect JSON.parse() calls
+        if node_type == "CallExpression":
+            callee = node.get("callee", {})
+            callee_name = self._get_function_name_from_ast(callee)
+            
+            if callee_name == "JSON.parse":
+                # Find the variable this is assigned to
+                variable_name = self._get_assigned_variable(node)
+                source_info = {
+                    "type": "json_parse",
+                    "line": node.get("loc", {}).get("start", {}).get("line"),
+                    "column": node.get("loc", {}).get("start", {}).get("column"),
+                    "variable": variable_name,
+                    "node": node,
+                }
+                self.sources.append(source_info)
+            
+            # Detect DOM attribute access patterns
+            elif callee_name and ("getAttribute" in callee_name or "dataset" in callee_name):
+                variable_name = self._get_assigned_variable(node)
+                source_info = {
+                    "type": "dom_attribute",
+                    "line": node.get("loc", {}).get("start", {}).get("line"),
+                    "column": node.get("loc", {}).get("start", {}).get("column"),
+                    "variable": variable_name,
+                    "method": callee_name,
+                    "node": node,
+                }
+                self.sources.append(source_info)
+            
+            # Detect querySelector/querySelectorAll (often used with getAttribute)
+            elif callee_name and "querySelector" in callee_name:
+                # Check if result is used with getAttribute
+                variable_name = self._get_assigned_variable(node)
+                if variable_name:
+                    source_info = {
+                        "type": "dom_query",
+                        "line": node.get("loc", {}).get("start", {}).get("line"),
+                        "column": node.get("loc", {}).get("start", {}).get("column"),
+                        "variable": variable_name,
+                        "method": callee_name,
+                        "node": node,
+                    }
+                    self.sources.append(source_info)
+        
+        # Detect form input access
+        elif node_type == "MemberExpression":
+            prop_name = self._get_property_name_from_ast(node)
+            if prop_name in ("value", "textContent", "innerHTML"):
+                # Check if accessing form element
+                obj_name = self._get_object_name_from_ast(node)
+                if obj_name:
+                    variable_name = self._get_assigned_variable(node)
+                    source_info = {
+                        "type": "user_input",
+                        "line": node.get("loc", {}).get("start", {}).get("line"),
+                        "column": node.get("loc", {}).get("start", {}).get("column"),
+                        "variable": variable_name,
+                        "property": prop_name,
+                        "object": obj_name,
+                        "node": node,
+                    }
+                    self.sources.append(source_info)
+        
+        # Recursively search children
+        for key, value in node.items():
+            if key in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(value, dict):
+                self._find_sources_in_ast(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        self._find_sources_in_ast(item)
+    
+    def _get_assigned_variable(self, node: Any, parent: Optional[Any] = None) -> Optional[str]:
+        """
+        Get the variable name that a node is assigned to.
+        
+        Args:
+            node: AST node (usually a CallExpression)
+            parent: Parent node (for context)
+            
+        Returns:
+            Variable name or None
+        """
+        # This method is called during AST traversal, so we need to check
+        # if the node is part of a VariableDeclarator or AssignmentExpression
+        # We'll extract this during the traversal in _extract_variable_assignments
+        # For now, return None - the actual extraction happens in _extract_variable_assignments
+        return None
+    
+    def _get_object_name_from_ast(self, member_expr: Dict[str, Any]) -> Optional[str]:
+        """
+        Get the object name from a MemberExpression.
+        
+        Args:
+            member_expr: MemberExpression AST node
+            
+        Returns:
+            Object name or None
+        """
+        if member_expr.get("type") != "MemberExpression":
+            return None
+        
+        obj = member_expr.get("object", {})
+        if obj.get("type") == "Identifier":
+            return obj.get("name")
+        elif obj.get("type") == "MemberExpression":
+            # Recursive member access like document.getElementById
+            return self._get_object_name_from_ast(obj)
+        
+        return None
+    
+    def _track_data_flow(self, ast: Dict[str, Any]) -> None:
+        """
+        Track data flow by analyzing variable assignments.
+        
+        This builds a map of which variables are assigned from sources.
+        
+        Args:
+            ast: Parsed AST dictionary
+        """
+        ast_root = ast.get("ast")
+        if not ast_root:
+            return
+        
+        self._extract_variable_assignments(ast_root)
+    
+    def _extract_variable_assignments(self, node: Any) -> None:
+        """
+        Extract variable assignments to track data flow.
+        
+        Args:
+            node: AST node to analyze
+        """
+        if not isinstance(node, dict):
+            return
+        
+        node_type = node.get("type")
+        
+        # Track variable declarations: var x = JSON.parse(...)
+        if node_type == "VariableDeclarator":
+            var_id = node.get("id", {})
+            init = node.get("init", {})
+            
+            if var_id.get("type") == "Identifier":
+                var_name = var_id.get("name")
+                
+                # Check if init is a source
+                if init.get("type") == "CallExpression":
+                    callee = init.get("callee", {})
+                    callee_name = self._get_function_name_from_ast(callee)
+                    
+                    if callee_name == "JSON.parse":
+                        if var_name not in self.data_flow:
+                            self.data_flow[var_name] = []
+                        self.data_flow[var_name].append("json_parse")
+                        # Update source with variable name
+                        self._update_source_variable(init, var_name)
+                    
+                    elif callee_name and ("getAttribute" in callee_name or "dataset" in callee_name):
+                        if var_name not in self.data_flow:
+                            self.data_flow[var_name] = []
+                        self.data_flow[var_name].append("dom_attribute")
+                        self._update_source_variable(init, var_name)
+                    
+                    elif callee_name and "querySelector" in callee_name:
+                        if var_name not in self.data_flow:
+                            self.data_flow[var_name] = []
+                        self.data_flow[var_name].append("dom_query")
+                        self._update_source_variable(init, var_name)
+                
+                # Check for nested patterns like: var x = element.getAttribute('data')
+                elif init.get("type") == "MemberExpression":
+                    # This handles cases like: var x = el.getAttribute('data')
+                    obj = init.get("object", {})
+                    prop = init.get("property", {})
+                    if prop.get("type") == "Identifier" and prop.get("name") in ("getAttribute", "dataset"):
+                        if var_name not in self.data_flow:
+                            self.data_flow[var_name] = []
+                        self.data_flow[var_name].append("dom_attribute")
+        
+        # Track assignment expressions: x = JSON.parse(...)
+        elif node_type == "AssignmentExpression":
+            left = node.get("left", {})
+            right = node.get("right", {})
+            
+            if left.get("type") == "Identifier":
+                var_name = left.get("name")
+                
+                # Check if right side is a source
+                if right.get("type") == "CallExpression":
+                    callee = right.get("callee", {})
+                    callee_name = self._get_function_name_from_ast(callee)
+                    
+                    if callee_name == "JSON.parse":
+                        if var_name not in self.data_flow:
+                            self.data_flow[var_name] = []
+                        self.data_flow[var_name].append("json_parse")
+                        self._update_source_variable(right, var_name)
+                    
+                    elif callee_name and ("getAttribute" in callee_name or "dataset" in callee_name):
+                        if var_name not in self.data_flow:
+                            self.data_flow[var_name] = []
+                        self.data_flow[var_name].append("dom_attribute")
+                        self._update_source_variable(right, var_name)
+        
+        # Recursively search children
+        for key, value in node.items():
+            if key in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(value, dict):
+                self._extract_variable_assignments(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        self._extract_variable_assignments(item)
+    
+    def _update_source_variable(self, node: Any, var_name: str) -> None:
+        """
+        Update source entry with variable name.
+        
+        Args:
+            node: Source node (CallExpression)
+            var_name: Variable name it's assigned to
+        """
+        node_line = node.get("loc", {}).get("start", {}).get("line")
+        for source in self.sources:
+            if source.get("line") == node_line and source.get("variable") is None:
+                source["variable"] = var_name
+                break
     
     def _check_function_vulnerability(self, func: Dict[str, Any], ast: Dict[str, Any]) -> None:
         """
@@ -165,13 +450,23 @@ class PrototypePollutionAnalyzer:
             return
         
         # Analyze function semantically using AST
-        analysis_result = self._analyze_function_ast(func_ast, func_name)
+        analysis_result = self._analyze_function_ast(func_ast, func_name, ast)
         
         if analysis_result["is_vulnerable"]:
             func_display_name = func_name if func_name else "(anonymous)"
             severity = analysis_result.get("severity", "high")
-            message = analysis_result.get("message", 
-                f"Function '{func_display_name}' is vulnerable to prototype pollution.")
+            
+            # Enhance message with source information if available
+            source_info = analysis_result.get("source_info")
+            if source_info:
+                message = (
+                    f"Function '{func_display_name}' performs property copying/merging "
+                    f"with data from {source_info['type']} source (line {source_info['line']}) "
+                    f"without validating dangerous properties. This creates a prototype pollution vulnerability."
+                )
+            else:
+                message = analysis_result.get("message", 
+                    f"Function '{func_display_name}' is vulnerable to prototype pollution.")
             
             code_snippet = func.get("body", "")[:300] if func.get("body") else ""
             
@@ -243,33 +538,35 @@ class PrototypePollutionAnalyzer:
         
         return None
     
-    def _analyze_function_ast(self, func_node: Dict[str, Any], func_name: str) -> Dict[str, Any]:
+    def _analyze_function_ast(self, func_node: Dict[str, Any], func_name: str, ast: Dict[str, Any]) -> Dict[str, Any]:
         """
         Semantically analyze a function AST node for prototype pollution vulnerabilities.
         
-        This method detects sinks (dangerous operations) by analyzing AST structure:
-        - Property assignments (MemberExpression with AssignmentExpression)
-        - For...in loops that iterate over object properties
-        - Recursive function calls
-        - Object.assign calls
+        This method detects sinks (dangerous operations) and checks if source data reaches them.
         
         Args:
             func_node: Function AST node
             func_name: Function name
+            ast: Full AST dictionary
             
         Returns:
-            Dictionary with analysis results
+            Dictionary with analysis results including source-sink relationships
         """
         result = {
             "is_vulnerable": False,
             "severity": "low",
             "message": "",
             "vulnerability_type": "",
+            "source_info": None,
         }
         
         func_body = func_node.get("body", {})
         if not func_body:
             return result
+        
+        # Get function parameters (potential sources)
+        func_params = func_node.get("params", [])
+        param_names = [p.get("name") for p in func_params if p.get("type") == "Identifier"]
         
         # Analyze function body semantically
         sink_analysis = self._find_prototype_pollution_sinks(func_body, func_name)
@@ -278,19 +575,33 @@ class PrototypePollutionAnalyzer:
             has_validation = sink_analysis["has_validation"]
             is_recursive = sink_analysis["is_recursive"]
             
+            # Check if source data flows to this function
+            source_info = self._check_source_to_sink_flow(func_body, param_names, ast)
+            
             if not has_validation:
                 result["is_vulnerable"] = True
-                result["severity"] = "high"
+                result["severity"] = "high" if source_info else "high"
                 result["vulnerability_type"] = "vulnerable_recursive_merge" if is_recursive else "vulnerable_property_assignment"
-                result["message"] = (
-                    f"Function '{func_name if func_name else '(anonymous)'}' performs property copying/merging "
-                    f"without validating dangerous properties (__proto__, constructor, prototype). "
-                    f"This makes it vulnerable to prototype pollution attacks."
-                )
+                result["source_info"] = source_info
+                
+                if source_info:
+                    result["vulnerability_type"] = "source_to_sink_pollution"
+                    result["message"] = (
+                        f"Function '{func_name if func_name else '(anonymous)'}' receives data from "
+                        f"{source_info['type']} source and performs property copying/merging "
+                        f"without validating dangerous properties. This creates a prototype pollution vulnerability."
+                    )
+                else:
+                    result["message"] = (
+                        f"Function '{func_name if func_name else '(anonymous)'}' performs property copying/merging "
+                        f"without validating dangerous properties (__proto__, constructor, prototype). "
+                        f"This makes it vulnerable to prototype pollution attacks."
+                    )
             elif sink_analysis["has_partial_validation"]:
                 result["is_vulnerable"] = True
                 result["severity"] = "medium"
                 result["vulnerability_type"] = "partially_safe_recursive_merge"
+                result["source_info"] = source_info
                 result["message"] = (
                     f"Function '{func_name if func_name else '(anonymous)'}' performs deep property copying "
                     f"with partial validation. Please verify that all dangerous properties "
@@ -298,6 +609,84 @@ class PrototypePollutionAnalyzer:
                 )
         
         return result
+    
+    def _check_source_to_sink_flow(self, func_body: Any, param_names: List[str], ast: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Check if source data flows to sinks in the function.
+        
+        Args:
+            func_body: Function body AST node
+            param_names: List of function parameter names
+            ast: Full AST dictionary
+            
+        Returns:
+            Source information if flow detected, None otherwise
+        """
+        # Check if any parameter comes from a known source
+        for param_name in param_names:
+            if param_name in self.data_flow:
+                source_types = self.data_flow[param_name]
+                # Find the source details
+                for source in self.sources:
+                    if source.get("variable") == param_name or source.get("type") in source_types:
+                        return {
+                            "type": source.get("type", "unknown"),
+                            "line": source.get("line"),
+                            "variable": param_name,
+                        }
+        
+        # Check if function body uses variables that come from sources
+        used_vars = self._extract_variable_usage(func_body)
+        for var_name in used_vars:
+            if var_name in self.data_flow:
+                source_types = self.data_flow[var_name]
+                for source in self.sources:
+                    if source.get("variable") == var_name or source.get("type") in source_types:
+                        return {
+                            "type": source.get("type", "unknown"),
+                            "line": source.get("line"),
+                            "variable": var_name,
+                        }
+        
+        return None
+    
+    def _extract_variable_usage(self, node: Any) -> List[str]:
+        """
+        Extract variable names used in a node.
+        
+        Args:
+            node: AST node to analyze
+            
+        Returns:
+            List of variable names used
+        """
+        used_vars = []
+        
+        if not isinstance(node, dict):
+            return used_vars
+        
+        node_type = node.get("type")
+        
+        if node_type == "Identifier":
+            used_vars.append(node.get("name"))
+        elif node_type == "MemberExpression":
+            # Extract object name
+            obj = node.get("object", {})
+            if obj.get("type") == "Identifier":
+                used_vars.append(obj.get("name"))
+        
+        # Recursively search children
+        for key, value in node.items():
+            if key in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(value, dict):
+                used_vars.extend(self._extract_variable_usage(value))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        used_vars.extend(self._extract_variable_usage(item))
+        
+        return list(set(used_vars))  # Remove duplicates
     
     def _find_prototype_pollution_sinks(self, node: Any, func_name: str) -> Dict[str, Any]:
         """

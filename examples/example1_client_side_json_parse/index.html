@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Client-Side JSON.parse Source Example</title>
+</head>
+<body>
+    <h1>Prototype Pollution Test - Example 1</h1>
+    
+    <!-- Source: User-controlled JSON data in DOM attribute -->
+    <div id="config" data-config='{"theme": "dark", "__proto__": {"polluted": "YES"}}'>
+        Configuration
+    </div>
+    
+    <script src="source.js"></script>
+    <script src="sink.js"></script>
+    <script src="main.js"></script>
+</body>
+</html>
+
