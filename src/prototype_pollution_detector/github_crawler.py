@@ -33,6 +33,7 @@ except ImportError:
         return func
 
 from .config import config
+from .parser import JavaScriptParser
 
 
 @dataclass
@@ -390,24 +391,60 @@ class GitHubCrawler:
                 if re.search(pattern, line, re.IGNORECASE):
                     matches.append(i)
                     break
-        
+
         if not matches:
             # Return first 50 lines if no matches found
             return '\n'.join(lines[:50])
-        
+
+        match_lines = [m + 1 for m in matches]
+
+        # Try to return the enclosing function or block using the parser so
+        # that the snippet contains a syntactically complete construct.
+        ast_snippet = self._extract_enclosing_function(code, file_path, match_lines)
+        if ast_snippet:
+            return ast_snippet
+
         # Extract context around matches
         start_line = max(0, min(matches) - context_lines)
         end_line = min(len(lines), max(matches) + context_lines)
-        
+
         snippet_lines = lines[start_line:end_line]
-        
-        # Add line numbers
-        numbered_lines = [
-            f"{start_line + i + 1:4d} | {line}"
-            for i, line in enumerate(snippet_lines)
-        ]
-        
-        return '\n'.join(numbered_lines)
+
+        # Keep raw code so downstream analyzers can parse valid JavaScript
+        return '\n'.join(snippet_lines)
+
+    def _extract_enclosing_function(
+        self,
+        code: str,
+        file_path: str,
+        match_lines: List[int]
+    ) -> Optional[str]:
+        """Return the full function containing the matched lines, if possible."""
+        try:
+            parser = JavaScriptParser(verbose=getattr(self, "verbose", False))
+            parsed = parser.parse_code(code, file_path)
+        except Exception:
+            return None
+
+        functions = parsed.get("functions") or []
+        if not functions:
+            return None
+
+        for line in match_lines:
+            for func in functions:
+                node = func.get("ast_node") or {}
+                loc = node.get("loc") or {}
+                start_line = ((loc.get("start") or {}).get("line"))
+                end_line = ((loc.get("end") or {}).get("line"))
+                if start_line is None or end_line is None:
+                    continue
+                if start_line <= line <= end_line:
+                    code_range = node.get("range")
+                    if code_range and len(code_range) == 2:
+                        start_idx, end_idx = code_range
+                        return code[start_idx:end_idx]
+
+        return None
     
     def save_results(self, snippets: List[CodeSnippet], output_file: str) -> None:
         """
@@ -430,4 +467,3 @@ class GitHubCrawler:
         
         if self.verbose:
             print(f"Saved {len(snippets)} snippets to {output_file}")
-
