@@ -98,6 +98,11 @@ Examples:
         help="Disable LLM filtering (faster but less accurate)",
     )
     crawl_parser.add_argument(
+        "--skip-analysis",
+        action="store_true",
+        help="Skip static analysis step and only collect snippets",
+    )
+    crawl_parser.add_argument(
         "-o", "--output",
         type=str,
         help="Output file for results (required for crawl)",
@@ -190,7 +195,8 @@ def handle_crawl(args) -> int:
             
             results = orchestrator.search_repository(
                 args.repo,
-                use_llm_filter=not args.no_llm
+                use_llm_filter=not args.no_llm,
+                skip_analysis=args.skip_analysis,
             )
         else:
             # General GitHub search
@@ -201,7 +207,8 @@ def handle_crawl(args) -> int:
                 max_results=args.max_results,
                 use_llm_filter=not args.no_llm,
                 languages=args.languages,
-                min_stars=args.min_stars
+                min_stars=args.min_stars,
+                skip_analysis=args.skip_analysis,
             )
         
         # Save results

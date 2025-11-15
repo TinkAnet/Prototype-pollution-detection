@@ -44,7 +44,8 @@ class CrawlerOrchestrator:
         max_results: int = 50,
         use_llm_filter: bool = True,
         languages: List[str] = None,
-        min_stars: int = 0
+        min_stars: int = 0,
+        skip_analysis: bool = False,
     ) -> Dict[str, Any]:
         """
         Crawl GitHub and analyze results for prototype pollution vulnerabilities.
@@ -116,9 +117,13 @@ class CrawlerOrchestrator:
             snippets = snippets[:max_results]
         
         # Step 3: Analyze with detector
-        if self.verbose:
-            print("Step 3: Analyzing code snippets with detector...")
-        
+        if skip_analysis:
+            if self.verbose:
+                print("Step 3: Analyzing code snippets with detector... (skipped)")
+        else:
+            if self.verbose:
+                print("Step 3: Analyzing code snippets with detector...")
+
         results = {
             "total_snippets": len(snippets),
             "analyzed_snippets": [],
@@ -130,25 +135,34 @@ class CrawlerOrchestrator:
                 "low": 0,
             },
         }
-        
+
         for snippet in snippets:
-            snippet_result = self._analyze_snippet(snippet)
+            if skip_analysis:
+                snippet_result = {
+                    "repository": snippet.repository,
+                    "file_path": snippet.file_path,
+                    "url": snippet.url,
+                    "language": snippet.language,
+                    "stars": snippet.stars,
+                    "vulnerabilities": [],
+                    "vulnerability_count": 0,
+                    "analysis_skipped": True,
+                }
+            else:
+                snippet_result = self._analyze_snippet(snippet)
+                vuln_count = len(snippet_result.get("vulnerabilities", []))
+                results["total_vulnerabilities"] += vuln_count
+                for vuln in snippet_result.get("vulnerabilities", []):
+                    vuln_type = vuln.get("type", "unknown")
+                    severity = vuln.get("severity", "low")
+                    results["vulnerabilities_by_type"][vuln_type] = \
+                        results["vulnerabilities_by_type"].get(vuln_type, 0) + 1
+                    results["vulnerabilities_by_severity"][severity] += 1
+
             results["analyzed_snippets"].append(snippet_result)
-            
-            vuln_count = len(snippet_result.get("vulnerabilities", []))
-            results["total_vulnerabilities"] += vuln_count
-            
-            # Count by type and severity
-            for vuln in snippet_result.get("vulnerabilities", []):
-                vuln_type = vuln.get("type", "unknown")
-                severity = vuln.get("severity", "low")
-                
-                results["vulnerabilities_by_type"][vuln_type] = \
-                    results["vulnerabilities_by_type"].get(vuln_type, 0) + 1
-                results["vulnerabilities_by_severity"][severity] += 1
         
         # Step 4: Generate summary with LLM (optional)
-        if self.llm_analyzer.is_available():
+        if not skip_analysis and self.llm_analyzer.is_available():
             if self.verbose:
                 print("Step 4: Generating summary with LLM...")
             
@@ -231,7 +245,8 @@ class CrawlerOrchestrator:
     def search_repository(
         self,
         repo_name: str,
-        use_llm_filter: bool = True
+        use_llm_filter: bool = True,
+        skip_analysis: bool = False,
     ) -> Dict[str, Any]:
         """
         Search and analyze a specific repository.
@@ -259,9 +274,22 @@ class CrawlerOrchestrator:
         }
         
         for snippet in snippets:
-            snippet_result = self._analyze_snippet(snippet)
+            if skip_analysis:
+                snippet_result = {
+                    "repository": snippet.repository,
+                    "file_path": snippet.file_path,
+                    "url": snippet.url,
+                    "language": snippet.language,
+                    "stars": snippet.stars,
+                    "vulnerabilities": [],
+                    "vulnerability_count": 0,
+                    "analysis_skipped": True,
+                }
+            else:
+                snippet_result = self._analyze_snippet(snippet)
+                results["total_vulnerabilities"] += snippet_result.get("vulnerability_count", 0)
+
             results["analyzed_snippets"].append(snippet_result)
-            results["total_vulnerabilities"] += snippet_result.get("vulnerability_count", 0)
         
         return results
     
@@ -338,4 +366,3 @@ class CrawlerOrchestrator:
             print(f"   Type: {vuln['type']}")
             print(f"   {vuln['message'][:100]}...")
             print(f"   URL: {vuln['url']}")
-

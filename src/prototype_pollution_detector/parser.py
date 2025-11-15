@@ -345,9 +345,21 @@ class JavaScriptParser:
             # Fallback: basic pattern matching
             return self._parse_code_regex(code, result)
         
+        parse_kwargs = {"loc": True, "range": True, "tolerant": True}
+
+        def _parse_with_module_fallback() -> Any:
+            """Try parseScript first, then fall back to parseModule."""
+            try:
+                return esprima.parseScript(code, **parse_kwargs)
+            except Exception as script_err:  # SyntaxError from esprima
+                try:
+                    return esprima.parseModule(code, **parse_kwargs)
+                except Exception:
+                    raise script_err
+
         try:
-            # Parse with esprima
-            ast_obj = esprima.parseScript(code, loc=True, range=True)
+            # Parse with esprima (script first, module fallback)
+            ast_obj = _parse_with_module_fallback()
             
             # Convert esprima AST object to dict if needed
             if hasattr(ast_obj, 'toDict'):

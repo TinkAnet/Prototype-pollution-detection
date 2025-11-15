@@ -7,6 +7,7 @@ be vulnerable to prototype pollution attacks.
 
 import re
 import time
+from pathlib import Path
 from typing import Dict, List, Any, Optional, Set
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -48,6 +49,7 @@ class CodeSnippet:
     context: Optional[str] = None
     stars: int = 0
     created_at: Optional[str] = None
+    saved_code_path: Optional[str] = None
 
 
 class GitHubCrawler:
@@ -99,6 +101,7 @@ class GitHubCrawler:
         """
         self.verbose = verbose
         self.github = None
+        self.code_output_dir = Path.cwd() / "crawler_sources"
         
         if Github is None:
             if verbose:
@@ -253,6 +256,9 @@ class GitHubCrawler:
                         language=language,
                         stars=repo.stargazers_count,
                         created_at=repo.created_at.isoformat() if repo.created_at else None,
+                        saved_code_path=self._save_full_code(
+                            f"{repo.owner.login}/{repo.name}", result.path, code
+                        ),
                     )
                     
                     snippets.append(snippet)
@@ -325,6 +331,9 @@ class GitHubCrawler:
                                 url=content.html_url,
                                 language=self._detect_language(content.name),
                                 stars=repo.stargazers_count,
+                                saved_code_path=self._save_full_code(
+                                    repo.full_name, content.path, code
+                                ),
                             )
                             snippets.append(snippet)
                 
@@ -369,7 +378,22 @@ class GitHubCrawler:
             if re.search(pattern, code, re.IGNORECASE | re.MULTILINE):
                 return True
         return False
-    
+
+    def _save_full_code(self, repository: str, file_path: str, code: str) -> Optional[str]:
+        """Persist the full file contents locally and return the saved path."""
+        if not code:
+            return None
+
+        try:
+            dest = self.code_output_dir / repository / file_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(code, encoding="utf-8", errors="ignore")
+            return str(dest.resolve())
+        except OSError as exc:
+            if self.verbose:
+                print(f"Warning: Could not save source for {repository}/{file_path}: {exc}")
+            return None
+
     def _extract_snippet(self, code: str, file_path: str, context_lines: int = 10) -> str:
         """
         Extract a relevant code snippet around matches.
