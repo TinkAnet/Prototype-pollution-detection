@@ -11,21 +11,21 @@ from dataclasses import dataclass
 
 
 @dataclass
-class Vulnerability:
+class TaintFinding:
     """
-    Represents a detected prototype pollution vulnerability.
+    Represents a detected taint flow that could lead to prototype pollution.
     
-    This class holds all the information about a vulnerability found during
-    analysis, including its location, severity, and details about how it
-    was detected.
+    This class holds all the information about a taint finding detected during
+    analysis, including its location, severity, and details about how the
+    tainted data flows from sources to sinks.
     """
     severity: str  # Severity level: 'high', 'medium', or 'low'
-    line: int  # Line number where the vulnerability was found
-    column: int  # Column number where the vulnerability was found
-    message: str  # Human-readable description of the vulnerability
-    code_snippet: str  # The actual code that contains the vulnerability
-    vulnerability_type: str  # Type of vulnerability (e.g., 'source_to_sink_pollution')
-    file: str = ""  # Path to the file where this vulnerability was found
+    line: int  # Line number where the finding was detected
+    column: int  # Column number where the finding was detected
+    message: str  # Human-readable description of the taint flow
+    code_snippet: str  # The actual code that contains the taint flow
+    finding_type: str  # Type of finding (e.g., 'source_to_sink_pollution')
+    file: str = ""  # Path to the file where this finding was detected
 
 
 class PrototypePollutionAnalyzer:
@@ -81,7 +81,7 @@ class PrototypePollutionAnalyzer:
             verbose: If True, print detailed progress information during analysis
         """
         self.verbose = verbose
-        self.vulnerabilities: List[Vulnerability] = []
+        self.findings: List[TaintFinding] = []
         
         # Track all data sources found across all files
         # Each source entry contains information about where user-controlled
@@ -115,9 +115,9 @@ class PrototypePollutionAnalyzer:
         
         # Deduplication: track which vulnerabilities we've already reported
         # Uses (file, line, column, type) tuple as the key
-        self._seen_vulns: Set[Tuple[str, int, int, str]] = set()
+        self._seen_findings: Set[Tuple[str, int, int, str]] = set()
     
-    def analyze_ast(self, ast: Dict[str, Any]) -> List[Vulnerability]:
+    def analyze_ast(self, ast: Dict[str, Any]) -> List[TaintFinding]:
         """
         Analyze an AST for prototype pollution vulnerabilities.
         
@@ -149,7 +149,7 @@ class PrototypePollutionAnalyzer:
             # For regular JavaScript files, analyze directly
             self._analyze_javascript_code(ast)
         
-        return self.vulnerabilities
+        return self.findings
     
     def finalize_analysis(self) -> None:
         """
@@ -268,7 +268,7 @@ class PrototypePollutionAnalyzer:
         for assign in assignments:
             prop_name = assign.get("property", "")
             if prop_name in self.DANGEROUS_PROPERTIES:
-                self._add_vuln(
+                self._add_finding(
                     severity="high",
                     line=assign.get("line", 0) or 0,
                     column=assign.get("column", 0) or 0,
@@ -277,7 +277,7 @@ class PrototypePollutionAnalyzer:
                         f"This could lead to prototype pollution."
                     ),
                     code_snippet=assign.get("code", ""),
-                    vulnerability_type="direct_dangerous_property_assignment",
+                    finding_type="direct_dangerous_property_assignment",
                     file=ast.get("file", ""),
                 )
     
@@ -897,13 +897,13 @@ class PrototypePollutionAnalyzer:
             # Include a code snippet to help developers find the issue
             code_snippet = func.get("body", "")[:300] if func.get("body") else ""
             
-            self._add_vuln(
+            self._add_finding(
                 severity=severity,
                 line=func_line,
                 column=func_column,
                 message=message,
                 code_snippet=code_snippet,
-                vulnerability_type=analysis_result.get("vulnerability_type", "vulnerable_function"),
+                finding_type=analysis_result.get("finding_type", "vulnerable_function"),
                 file=ast.get("file", ""),
             )
     
@@ -997,14 +997,14 @@ class PrototypePollutionAnalyzer:
             - is_vulnerable: Whether the function is vulnerable
             - severity: Severity level ('high', 'medium', 'low')
             - message: Human-readable description of the vulnerability
-            - vulnerability_type: Type of vulnerability found
+            - finding_type: Type of taint finding detected
             - source_info: Information about the source if tainted data flows in
         """
         result = {
             "is_vulnerable": False,
             "severity": "low",
             "message": "",
-            "vulnerability_type": "",
+            "finding_type": "",
             "source_info": None,
         }
         
@@ -1032,12 +1032,12 @@ class PrototypePollutionAnalyzer:
             if not has_validation:
                 result["is_vulnerable"] = True
                 result["severity"] = "high"
-                result["vulnerability_type"] = "vulnerable_recursive_merge" if is_recursive else "vulnerable_property_assignment"
+                result["finding_type"] = "vulnerable_recursive_merge" if is_recursive else "vulnerable_property_assignment"
                 result["source_info"] = source_info
                 
                 # If we found a source-to-sink flow, that's even more serious
                 if source_info:
-                    result["vulnerability_type"] = "source_to_sink_pollution"
+                    result["finding_type"] = "source_to_sink_pollution"
                     result["message"] = (
                         f"Function '{func_name if func_name else '(anonymous)'}' receives data from "
                         f"{source_info['type']} source and performs property copying/merging "
@@ -1053,7 +1053,7 @@ class PrototypePollutionAnalyzer:
             elif sink_analysis["has_partial_validation"]:
                 result["is_vulnerable"] = True
                 result["severity"] = "medium"
-                result["vulnerability_type"] = "partially_safe_recursive_merge"
+                result["finding_type"] = "partially_safe_recursive_merge"
                 result["source_info"] = source_info
                 result["message"] = (
                     f"Function '{func_name if func_name else '(anonymous)'}' performs deep property copying "
@@ -1213,11 +1213,11 @@ class PrototypePollutionAnalyzer:
                     call_line = call.get("line")
                     call_file = call.get("file")
                     
-                    # Find corresponding vulnerability for this sink function
-                    for vuln in self.vulnerabilities:
+                    # Find corresponding finding for this sink function
+                    for finding in self.findings:
                         # Match by function name in message or by checking if it's the sink function
-                        if func_name and (func_name.lower() in vuln.message.lower() or 
-                                         self._vulnerability_matches_function(vuln, func_name)):
+                        if func_name and (func_name.lower() in finding.message.lower() or 
+                                         self._finding_matches_function(finding, func_name)):
                             # Enhance vulnerability with source information
                             taint_arg = tainted_args[0]
                             taint_info = taint_arg["taint_info"]
@@ -1231,7 +1231,7 @@ class PrototypePollutionAnalyzer:
                                     "variable": None,
                                     "direct": True,
                                 }
-                                vuln.message = (
+                                finding.message = (
                                     f"Function '{func_name}' receives tainted data directly from {source_info['type']} source "
                                     f"at line {call_line} in {call_file} and performs property copying/merging "
                                     f"without validating dangerous properties. This creates a prototype pollution vulnerability."
@@ -1246,7 +1246,7 @@ class PrototypePollutionAnalyzer:
                                     "direct": False,
                                 }
                                 var_info = f"via variable '{source_info['variable']}'" if source_info["variable"] else ""
-                                vuln.message = (
+                                finding.message = (
                                     f"Function '{func_name}' receives tainted data from {source_info['type']} source "
                                     f"(line {source_info['line']} in {source_info['file']}) {var_info} "
                                     f"and performs property copying/merging without validating dangerous properties. "
@@ -1254,26 +1254,26 @@ class PrototypePollutionAnalyzer:
                                     f"Tainted data flows from source to sink at line {call_line} in {call_file}."
                                 )
                             
-                            vuln.vulnerability_type = "source_to_sink_pollution"
+                            finding.finding_type = "source_to_sink_pollution"
                             break
     
-    def _vulnerability_matches_function(self, vuln: Vulnerability, func_name: str) -> bool:
+    def _finding_matches_function(self, finding: TaintFinding, func_name: str) -> bool:
         """
-        Check if vulnerability is for a specific function.
+        Check if finding is for a specific function.
         
         Args:
-            vuln: Vulnerability object
+            finding: TaintFinding object
             func_name: Function name to match
             
         Returns:
-            True if vulnerability matches function
+            True if finding matches function
         """
-        # Extract function name from vulnerability message
-        if func_name.lower() in vuln.message.lower():
+        # Extract function name from finding message
+        if func_name.lower() in finding.message.lower():
             return True
         
         # Check code snippet
-        if func_name.lower() in vuln.code_snippet.lower():
+        if func_name.lower() in finding.code_snippet.lower():
             return True
         
         return False
@@ -1353,40 +1353,40 @@ class PrototypePollutionAnalyzer:
         
         return list(set(used_vars))  # Remove duplicates
     
-    def _add_vuln(self, *, severity: str, line: int, column: int, message: str,
-                  code_snippet: str, vulnerability_type: str, file: str) -> None:
+    def _add_finding(self, *, severity: str, line: int, column: int, message: str,
+                     code_snippet: str, finding_type: str, file: str) -> None:
         """
-        Add a vulnerability to the results list, with deduplication.
+        Add a taint finding to the results list, with deduplication.
         
-        This method prevents the same vulnerability from being reported multiple
+        This method prevents the same finding from being reported multiple
         times. It uses a combination of file, line, column, and type to create
-        a unique key for each vulnerability.
+        a unique key for each finding.
         
         Args:
             severity: Severity level ('high', 'medium', or 'low')
-            line: Line number where the vulnerability was found
-            column: Column number where the vulnerability was found
-            message: Human-readable description of the vulnerability
-            code_snippet: The actual code that contains the vulnerability
-            vulnerability_type: Type of vulnerability (e.g., 'source_to_sink_pollution')
-            file: Path to the file containing the vulnerability
+            line: Line number where the finding was detected
+            column: Column number where the finding was detected
+            message: Human-readable description of the taint flow
+            code_snippet: The actual code that contains the taint flow
+            finding_type: Type of finding (e.g., 'source_to_sink_pollution')
+            file: Path to the file containing the finding
         """
         # Create a unique key for deduplication
-        key = (file or "", int(line or 0), int(column or 0), vulnerability_type or "")
-        if key in self._seen_vulns:
+        key = (file or "", int(line or 0), int(column or 0), finding_type or "")
+        if key in self._seen_findings:
             return
         
-        # Mark this vulnerability as seen
-        self._seen_vulns.add(key)
+        # Mark this finding as seen
+        self._seen_findings.add(key)
         
         # Add it to the results list
-        self.vulnerabilities.append(Vulnerability(
+        self.findings.append(TaintFinding(
             severity=severity,
             line=line,
             column=column,
             message=message,
             code_snippet=code_snippet,
-            vulnerability_type=vulnerability_type,
+            finding_type=finding_type,
             file=file
         ))
     

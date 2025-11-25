@@ -20,9 +20,9 @@ class RepositoryAnalysis:
     """Analysis results for a single repository."""
     repository: str
     files: List[str]
-    vulnerabilities: List[Dict[str, Any]]
-    total_vulnerabilities: int
-    vulnerability_types: Dict[str, int]
+    findings: List[Dict[str, Any]]
+    total_findings: int
+    finding_types: Dict[str, int]
     severity_counts: Dict[str, int]
     has_source_to_sink_flows: bool
     analysis_metadata: Dict[str, Any]
@@ -33,10 +33,10 @@ class BatchAnalysisResult:
     """Results of batch analysis across multiple repositories."""
     total_repositories: int
     total_files: int
-    total_vulnerabilities: int
+    total_findings: int
     repositories: List[RepositoryAnalysis]
     global_statistics: Dict[str, Any]
-    unique_vulnerability_patterns: List[Dict[str, Any]]
+    unique_finding_patterns: List[Dict[str, Any]]
 
 
 class BatchAnalyzer:
@@ -45,9 +45,9 @@ class BatchAnalyzer:
     
     Features:
     - Groups files by repository for cross-file analysis
-    - Deduplicates vulnerabilities across repositories
+    - Deduplicates findings across repositories
     - Aggregates statistics
-    - Identifies unique vulnerability patterns
+    - Identifies unique finding patterns
     """
     
     def __init__(self, verbose: bool = False, path_manager=None):
@@ -69,7 +69,7 @@ class BatchAnalyzer:
         self.path_manager = path_manager
         
         # Deduplication tracking
-        self._vulnerability_signatures: Set[str] = set()
+        self._finding_signatures: Set[str] = set()
         self._code_hashes: Dict[str, str] = {}  # file_path -> hash
     
     def analyze_crawler_sources(
@@ -102,7 +102,7 @@ class BatchAnalyzer:
         
         # Step 2: Analyze each repository
         repository_results = []
-        all_vulnerabilities = []
+        all_findings = []
         
         for repo_name, file_paths in repo_files.items():
             if self.verbose:
@@ -117,36 +117,36 @@ class BatchAnalyzer:
             
             if repo_result:
                 repository_results.append(repo_result)
-                all_vulnerabilities.extend(repo_result.vulnerabilities)
+                all_findings.extend(repo_result.findings)
         
         # Step 3: Aggregate statistics
         global_stats = self._compute_global_statistics(repository_results)
         
-        # Step 4: Identify unique vulnerability patterns
-        unique_patterns = self._identify_unique_patterns(all_vulnerabilities)
+        # Step 4: Identify unique finding patterns
+        unique_patterns = self._identify_unique_patterns(all_findings)
         
         return BatchAnalysisResult(
             total_repositories=len(repository_results),
             total_files=sum(len(r.files) for r in repository_results),
-            total_vulnerabilities=len(all_vulnerabilities),
+            total_findings=len(all_findings),
             repositories=repository_results,
             global_statistics=global_stats,
-            unique_vulnerability_patterns=unique_patterns,
+            unique_finding_patterns=unique_patterns,
         )
     
     def _group_files_by_repository(self, sources_dir: Path) -> Dict[str, List[Path]]:
         """
         Group files by repository name.
         
-        Expected structure:
-        crawler_sources/
-          owner1/
-            repo1/
-              file1.js
-              file2.js
-          owner2/
-            repo2/
-              file1.js
+        Handles two directory structures:
+        1. Full structure with owner/repo:
+           crawler_sources/
+             owner1/
+               repo1/
+                 file1.js
+        2. Single repository directory:
+           repo_dir/
+             file1.js
         
         Returns:
             Dictionary mapping repo_name -> list of file paths
@@ -156,22 +156,59 @@ class BatchAnalyzer:
         if not sources_dir.exists():
             return repo_files
         
-        # Traverse directory structure
+        # Check if this is a single repository directory (contains files directly or has files in subdirs)
+        # First, check if there are any JS/HTML files directly in this directory
+        has_files_here = False
+        for pattern in ["*.js", "*.jsx", "*.mjs", "*.cjs", "*.html", "*.htm", "*.ts", "*.tsx"]:
+            if list(sources_dir.glob(pattern)):
+                has_files_here = True
+                break
+        
+        # If files are here, treat this as a single repository
+        if has_files_here:
+            repo_name = sources_dir.name
+            # If parent is an owner directory, use owner/repo format
+            if sources_dir.parent.name and sources_dir.parent.parent.exists():
+                # Check if parent looks like an owner directory (has other repo dirs)
+                parent_has_repos = any(d.is_dir() for d in sources_dir.parent.iterdir())
+                if parent_has_repos:
+                    repo_name = f"{sources_dir.parent.name}/{sources_dir.name}"
+            
+            for pattern in ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", 
+                           "**/*.html", "**/*.htm", "**/*.ts", "**/*.tsx"]:
+                for file_path in sources_dir.glob(pattern):
+                    if file_path.is_file():
+                        repo_files[repo_name].append(file_path)
+            
+            return dict(repo_files)
+        
+        # Otherwise, traverse owner/repo structure
         for owner_dir in sources_dir.iterdir():
             if not owner_dir.is_dir():
                 continue
             
-            for repo_dir in owner_dir.iterdir():
-                if not repo_dir.is_dir():
-                    continue
-                
-                # Repository name: owner/repo
-                repo_name = f"{owner_dir.name}/{repo_dir.name}"
-                
-                # Find all JavaScript/HTML files
+            # Check if owner_dir contains repo directories or files directly
+            subdirs = [d for d in owner_dir.iterdir() if d.is_dir()]
+            has_files = any(f.is_file() for f in owner_dir.iterdir())
+            
+            if subdirs:
+                # Standard owner/repo structure
+                for repo_dir in subdirs:
+                    # Repository name: owner/repo
+                    repo_name = f"{owner_dir.name}/{repo_dir.name}"
+                    
+                    # Find all JavaScript/HTML files
+                    for pattern in ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", 
+                                   "**/*.html", "**/*.htm", "**/*.ts", "**/*.tsx"]:
+                        for file_path in repo_dir.glob(pattern):
+                            if file_path.is_file():
+                                repo_files[repo_name].append(file_path)
+            elif has_files:
+                # Owner directory contains files directly (treat as repo)
+                repo_name = owner_dir.name
                 for pattern in ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", 
                                "**/*.html", "**/*.htm", "**/*.ts", "**/*.tsx"]:
-                    for file_path in repo_dir.glob(pattern):
+                    for file_path in owner_dir.glob(pattern):
                         if file_path.is_file():
                             repo_files[repo_name].append(file_path)
         
@@ -230,51 +267,51 @@ class BatchAnalyzer:
                 # This enables cross-file taint analysis
                 analysis_result = self.detector.analyze(temp_path)
                 
-                # Extract vulnerabilities
-                vulnerabilities = []
+                # Extract findings
+                findings = []
                 for file_result in analysis_result.get("files", []):
-                    file_vulns = file_result.get("vulnerabilities", [])
-                    for vuln in file_vulns:
+                    file_findings = file_result.get("findings", [])
+                    for finding in file_findings:
                         # Map back to original file path
                         temp_file = file_result.get("file", "")
                         original_file = self._map_to_original_path(temp_file, file_paths)
                         
-                        vuln_dict = {
-                            "severity": vuln.get("severity"),
-                            "line": vuln.get("line"),
-                            "column": vuln.get("column"),
-                            "message": vuln.get("message"),
-                            "code_snippet": vuln.get("code_snippet", "")[:200],  # Limit size
-                            "type": vuln.get("type"),
+                        finding_dict = {
+                            "severity": finding.get("severity"),
+                            "line": finding.get("line"),
+                            "column": finding.get("column"),
+                            "message": finding.get("message"),
+                            "code_snippet": finding.get("code_snippet", "")[:200],  # Limit size
+                            "type": finding.get("type"),
                             "file": original_file,
                         }
                         
                         # Deduplicate by signature
-                        signature = self._vulnerability_signature(vuln_dict)
-                        if signature not in self._vulnerability_signatures:
-                            self._vulnerability_signatures.add(signature)
-                            vulnerabilities.append(vuln_dict)
+                        signature = self._finding_signature(finding_dict)
+                        if signature not in self._finding_signatures:
+                            self._finding_signatures.add(signature)
+                            findings.append(finding_dict)
                 
                 # Compute statistics
-                vulnerability_types = defaultdict(int)
+                finding_types = defaultdict(int)
                 severity_counts = defaultdict(int)
                 has_source_to_sink = False
                 
-                for vuln in vulnerabilities:
-                    vuln_type = vuln.get("type", "unknown")
-                    severity = vuln.get("severity", "low")
-                    vulnerability_types[vuln_type] += 1
+                for finding in findings:
+                    finding_type = finding.get("type", "unknown")
+                    severity = finding.get("severity", "low")
+                    finding_types[finding_type] += 1
                     severity_counts[severity] += 1
                     
-                    if "source_to_sink" in vuln_type.lower():
+                    if "source_to_sink" in finding_type.lower():
                         has_source_to_sink = True
                 
                 return RepositoryAnalysis(
                     repository=repo_name,
                     files=[str(f) for f in file_paths],
-                    vulnerabilities=vulnerabilities,
-                    total_vulnerabilities=len(vulnerabilities),
-                    vulnerability_types=dict(vulnerability_types),
+                    findings=findings,
+                    total_findings=len(findings),
+                    finding_types=dict(finding_types),
                     severity_counts=dict(severity_counts),
                     has_source_to_sink_flows=has_source_to_sink,
                     analysis_metadata={
@@ -343,10 +380,10 @@ class BatchAnalyzer:
         """
         # Create signature from key fields
         key_fields = (
-            vuln.get("type", ""),
-            vuln.get("message", "")[:100],  # First 100 chars
-            vuln.get("file", ""),
-            vuln.get("line", 0),
+            finding.get("type", ""),
+            finding.get("message", "")[:100],  # First 100 chars
+            finding.get("file", ""),
+            finding.get("line", 0),
         )
         signature_str = "|".join(str(f) for f in key_fields)
         return hashlib.md5(signature_str.encode()).hexdigest()
@@ -364,17 +401,17 @@ class BatchAnalyzer:
         Returns:
             Dictionary with global statistics
         """
-        total_vulns = sum(r.total_vulnerabilities for r in repository_results)
+        total_findings = sum(r.total_findings for r in repository_results)
         total_files = sum(len(r.files) for r in repository_results)
         
-        # Aggregate vulnerability types
+        # Aggregate finding types
         type_counts = defaultdict(int)
         severity_counts = defaultdict(int)
         repos_with_source_to_sink = 0
         
         for repo_result in repository_results:
-            for vuln_type, count in repo_result.vulnerability_types.items():
-                type_counts[vuln_type] += count
+            for finding_type, count in repo_result.finding_types.items():
+                type_counts[finding_type] += count
             
             for severity, count in repo_result.severity_counts.items():
                 severity_counts[severity] += count
@@ -383,31 +420,31 @@ class BatchAnalyzer:
                 repos_with_source_to_sink += 1
         
         return {
-            "total_vulnerabilities": total_vulns,
+            "total_findings": total_findings,
             "total_files": total_files,
-            "average_vulnerabilities_per_repo": (
-                total_vulns / len(repository_results) if repository_results else 0
+            "average_findings_per_repo": (
+                total_findings / len(repository_results) if repository_results else 0
             ),
-            "average_vulnerabilities_per_file": (
-                total_vulns / total_files if total_files > 0 else 0
+            "average_findings_per_file": (
+                total_findings / total_files if total_files > 0 else 0
             ),
-            "vulnerability_types": dict(type_counts),
+            "finding_types": dict(type_counts),
             "severity_distribution": dict(severity_counts),
             "repositories_with_source_to_sink_flows": repos_with_source_to_sink,
-            "repositories_with_vulnerabilities": len([
-                r for r in repository_results if r.total_vulnerabilities > 0
+            "repositories_with_findings": len([
+                r for r in repository_results if r.total_findings > 0
             ]),
         }
     
     def _identify_unique_patterns(
         self,
-        vulnerabilities: List[Dict[str, Any]],
+        findings: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """
-        Identify unique vulnerability patterns across repositories.
+        Identify unique finding patterns across repositories.
         
         Args:
-            vulnerabilities: List of all vulnerabilities
+            findings: List of all findings
             
         Returns:
             List of unique patterns with occurrence counts
@@ -415,13 +452,13 @@ class BatchAnalyzer:
         # Group by vulnerability type and message pattern
         pattern_groups = defaultdict(list)
         
-        for vuln in vulnerabilities:
+        for finding in findings:
             # Create pattern key from type and message
             pattern_key = (
-                vuln.get("type", "unknown"),
-                vuln.get("message", "")[:150],  # First 150 chars
+                finding.get("type", "unknown"),
+                finding.get("message", "")[:150],  # First 150 chars
             )
-            pattern_groups[pattern_key].append(vuln)
+            pattern_groups[pattern_key].append(finding)
         
         # Convert to list of patterns
         unique_patterns = []
@@ -460,42 +497,72 @@ class BatchAnalyzer:
         if output_path is None:
             # Use organized structure
             result_dir = self.path_manager.get_batch_result_dir()
-            output_path = result_dir / "summary.json"
             
-            # Also save detailed results
+            # Save summary.json - high-level statistics only (no full finding lists)
+            summary_file = result_dir / "summary.json"
+            summary_data = {
+                "total_repositories": results.total_repositories,
+                "total_files": results.total_files,
+                "total_findings": results.total_findings,
+                "global_statistics": results.global_statistics,
+                "unique_finding_patterns": results.unique_finding_patterns,
+                "repositories_summary": [
+                    {
+                        "repository": r.repository,
+                        "file_count": len(r.files),
+                        "finding_count": r.total_findings,
+                        "finding_types": r.finding_types,
+                        "severity_counts": r.severity_counts,
+                        "has_source_to_sink_flows": r.has_source_to_sink_flows,
+                    }
+                    for r in results.repositories
+                ],
+            }
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(summary_data, f, indent=2, ensure_ascii=False)
+            
+            # Save detailed.json - full results with all finding details
             detailed_file = result_dir / "detailed.json"
             with open(detailed_file, 'w', encoding='utf-8') as f:
                 json.dump(asdict(results), f, indent=2, ensure_ascii=False)
             
-            # Save repositories separately for easier access
-            repos_file = result_dir / "repositories.json"
-            repos_data = {
-                "total_repositories": results.total_repositories,
-                "total_files": results.total_files,
-                "total_vulnerabilities": results.total_vulnerabilities,
-                "repositories": [asdict(r) for r in results.repositories],
-            }
+            # Save repositories.jsonl - one repository per line (JSONL format for easier processing)
+            repos_file = result_dir / "repositories.jsonl"
             with open(repos_file, 'w', encoding='utf-8') as f:
-                json.dump(repos_data, f, indent=2, ensure_ascii=False)
+                for repo in results.repositories:
+                    f.write(json.dumps(asdict(repo), ensure_ascii=False) + '\n')
             
             # Create symlink to latest
             self.path_manager.create_latest_symlink(result_dir, "latest")
+            
+            if self.verbose:
+                print(f"Results saved to {summary_file}")
+            
+            return summary_file
         
-        # Save summary
+        # Custom output path specified - save summary format there
         if format == "json":
-            # Convert to dictionary
-            results_dict = {
+            # Save summary format (without full finding lists)
+            summary_data = {
                 "total_repositories": results.total_repositories,
                 "total_files": results.total_files,
-                "total_vulnerabilities": results.total_vulnerabilities,
-                "repositories": [asdict(r) for r in results.repositories],
+                "total_findings": results.total_findings,
                 "global_statistics": results.global_statistics,
-                "unique_vulnerability_patterns": results.unique_vulnerability_patterns,
+                "unique_finding_patterns": results.unique_finding_patterns,
+                "repositories_summary": [
+                    {
+                        "repository": r.repository,
+                        "file_count": len(r.files),
+                        "finding_count": r.total_findings,
+                        "finding_types": r.finding_types,
+                        "severity_counts": r.severity_counts,
+                        "has_source_to_sink_flows": r.has_source_to_sink_flows,
+                    }
+                    for r in results.repositories
+                ],
             }
-            
             with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(results_dict, f, indent=2, ensure_ascii=False)
-        
+                json.dump(summary_data, f, indent=2, ensure_ascii=False)
         elif format == "jsonl":
             # Save as JSONL (one repository per line)
             with open(output_path, 'w', encoding='utf-8') as f:
@@ -520,43 +587,43 @@ class BatchAnalyzer:
         
         print(f"\nRepositories analyzed: {results.total_repositories}")
         print(f"Total files: {results.total_files}")
-        print(f"Total vulnerabilities: {results.total_vulnerabilities}")
+        print(f"Total findings: {results.total_findings}")
         
         stats = results.global_statistics
-        print(f"\nAverage vulnerabilities per repository: {stats['average_vulnerabilities_per_repo']:.2f}")
-        print(f"Average vulnerabilities per file: {stats['average_vulnerabilities_per_file']:.2f}")
+        print(f"\nAverage findings per repository: {stats['average_findings_per_repo']:.2f}")
+        print(f"Average findings per file: {stats['average_findings_per_file']:.2f}")
         
         print(f"\nSeverity distribution:")
         for severity, count in stats['severity_distribution'].items():
             print(f"  {severity.upper()}: {count}")
         
-        print(f"\nVulnerability types:")
-        for vuln_type, count in sorted(
-            stats['vulnerability_types'].items(),
+        print(f"\nFinding types:")
+        for finding_type, count in sorted(
+            stats['finding_types'].items(),
             key=lambda x: x[1],
             reverse=True
         )[:10]:  # Top 10
-            print(f"  {vuln_type}: {count}")
+            print(f"  {finding_type}: {count}")
         
         print(f"\nRepositories with source-to-sink flows: {stats['repositories_with_source_to_sink_flows']}")
         
-        print(f"\nTop 10 unique vulnerability patterns:")
-        for i, pattern in enumerate(results.unique_vulnerability_patterns[:10], 1):
+        print(f"\nTop 10 unique finding patterns:")
+        for i, pattern in enumerate(results.unique_finding_patterns[:10], 1):
             print(f"\n{i}. {pattern['type']} (occurs {pattern['occurrence_count']} times)")
             print(f"   Severity: {pattern['severity'].upper()}")
             print(f"   Pattern: {pattern['message_pattern'][:100]}...")
         
         print("\n" + "="*80)
         
-        # Top repositories by vulnerability count
+        # Top repositories by finding count
         top_repos = sorted(
             results.repositories,
-            key=lambda r: r.total_vulnerabilities,
+            key=lambda r: r.total_findings,
             reverse=True
         )[:5]
         
         if top_repos:
-            print("\nTop 5 repositories by vulnerability count:")
+            print("\nTop 5 repositories by finding count:")
             for i, repo in enumerate(top_repos, 1):
-                print(f"{i}. {repo.repository}: {repo.total_vulnerabilities} vulnerabilities")
+                print(f"{i}. {repo.repository}: {repo.total_findings} findings")
 

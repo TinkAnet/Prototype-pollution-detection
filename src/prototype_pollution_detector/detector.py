@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Any
 
 from .parser import JavaScriptParser
-from .analysis import PrototypePollutionAnalyzer, Vulnerability
+from .analysis import PrototypePollutionAnalyzer, TaintFinding
 
 
 class PrototypePollutionDetector:
@@ -80,8 +80,8 @@ class PrototypePollutionDetector:
         Returns:
             Dictionary containing:
             - file: Path to the analyzed file
-            - vulnerabilities: List of vulnerability dictionaries
-            - vulnerability_count: Number of vulnerabilities found
+            - findings: List of finding dictionaries
+            - finding_count: Number of findings detected
             - skipped: True if file was skipped (with reason)
             - error: Error message if analysis failed
         """
@@ -102,24 +102,24 @@ class PrototypePollutionDetector:
             # Parse the file into an abstract syntax tree
             ast = self.parser.parse_file(file_path)
             
-            # Analyze the AST for prototype pollution vulnerabilities
-            vulnerabilities = self.analyzer.analyze_ast(ast)
+            # Analyze the AST for taint findings
+            findings = self.analyzer.analyze_ast(ast)
             
-            # Convert vulnerability objects to dictionaries for JSON serialization
+            # Convert finding objects to dictionaries for JSON serialization
             return {
                 "file": str(file_path),
-                "vulnerabilities": [
+                "findings": [
                     {
-                        "severity": v.severity,
-                        "line": v.line,
-                        "column": v.column,
-                        "message": v.message,
-                        "code_snippet": v.code_snippet,
-                        "type": v.vulnerability_type,
+                        "severity": f.severity,
+                        "line": f.line,
+                        "column": f.column,
+                        "message": f.message,
+                        "code_snippet": f.code_snippet,
+                        "type": f.finding_type,
                     }
-                    for v in vulnerabilities
+                    for f in findings
                 ],
-                "vulnerability_count": len(vulnerabilities),
+                "finding_count": len(findings),
             }
         
         except Exception as e:
@@ -153,7 +153,7 @@ class PrototypePollutionDetector:
         results = {
             "directory": str(dir_path),
             "files": [],
-            "total_vulnerabilities": 0,
+            "total_findings": 0,
         }
         
         # Find all JavaScript and HTML files recursively
@@ -171,36 +171,36 @@ class PrototypePollutionDetector:
         # This finds vulnerabilities where data flows across file boundaries
         self.analyzer.finalize_analysis()
         
-        # Get all vulnerabilities found (including cross-file ones)
-        final_vulns = self.analyzer.vulnerabilities
-        results["total_vulnerabilities"] = len(final_vulns)
+        # Get all findings detected (including cross-file ones)
+        final_findings = self.analyzer.findings
+        results["total_findings"] = len(final_findings)
         
-        # Update each file's results with the final vulnerability list
-        # We match vulnerabilities to files using the file path stored in each vulnerability
+        # Update each file's results with the final findings list
+        # We match findings to files using the file path stored in each finding
         for file_result in results["files"]:
             file_path = file_result.get("file", "")
-            file_vulns = []
-            for v in final_vulns:
-                # Match vulnerabilities to files by checking the file attribute
-                if hasattr(v, 'file') and v.file == file_path:
-                    file_vulns.append(v)
+            file_findings = []
+            for f in final_findings:
+                # Match findings to files by checking the file attribute
+                if hasattr(f, 'file') and f.file == file_path:
+                    file_findings.append(f)
                 # Fallback: check if file path appears in code snippet or message
-                elif file_path in str(v.code_snippet) or file_path in v.message:
-                    file_vulns.append(v)
+                elif file_path in str(f.code_snippet) or file_path in f.message:
+                    file_findings.append(f)
             
-            # Update the file result with matched vulnerabilities
-            file_result["vulnerabilities"] = [
+            # Update the file result with matched findings
+            file_result["findings"] = [
                 {
-                    "severity": v.severity,
-                    "line": v.line,
-                    "column": v.column,
-                    "message": v.message,
-                    "code_snippet": v.code_snippet,
-                    "type": v.vulnerability_type,
+                    "severity": f.severity,
+                    "line": f.line,
+                    "column": f.column,
+                    "message": f.message,
+                    "code_snippet": f.code_snippet,
+                    "type": f.finding_type,
                 }
-                for v in file_vulns
+                for f in file_findings
             ]
-            file_result["vulnerability_count"] = len(file_vulns)
+            file_result["finding_count"] = len(file_findings)
         
         return results
     
@@ -218,7 +218,7 @@ class PrototypePollutionDetector:
         if "directory" in results:
             print(f"\n=== Analysis Results for {results['directory']} ===\n")
             print(f"Files analyzed: {len(results['files'])}")
-            print(f"Total vulnerabilities found: {results['total_vulnerabilities']}\n")
+            print(f"Total findings detected: {results['total_findings']}\n")
             
             for file_result in results["files"]:
                 if file_result.get("skipped"):
@@ -226,8 +226,8 @@ class PrototypePollutionDetector:
                 
                 if "error" in file_result:
                     print(f"[ERROR] {file_result['file']}: Error - {file_result['error']}")
-                elif file_result["vulnerability_count"] > 0:
-                    print(f"[WARNING] {file_result['file']}: {file_result['vulnerability_count']} vulnerability(ies)")
+                elif file_result["finding_count"] > 0:
+                    print(f"[WARNING] {file_result['file']}: {file_result['finding_count']} finding(s)")
                     for vuln in file_result["vulnerabilities"]:
                         print(f"   [{vuln['severity'].upper()}] Line {vuln['line']}: {vuln['message']}")
                 else:
@@ -240,7 +240,7 @@ class PrototypePollutionDetector:
                 print(f"Error: {results['error']}")
             else:
                 print(f"\n=== Analysis Results for {results['file']} ===\n")
-                print(f"Vulnerabilities found: {results['vulnerability_count']}\n")
+                print(f"Findings detected: {results['finding_count']}\n")
                 
                 for vuln in results["vulnerabilities"]:
                     print(f"[{vuln['severity'].upper()}] Line {vuln['line']}, Column {vuln['column']}")

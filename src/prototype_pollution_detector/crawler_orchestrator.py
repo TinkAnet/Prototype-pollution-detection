@@ -13,7 +13,7 @@ from dataclasses import asdict
 from .github_crawler import GitHubCrawler, CodeSnippet
 from .llm_analyzer import LLMAnalyzer
 from .detector import PrototypePollutionDetector
-from .analysis import Vulnerability
+from .analysis import TaintFinding
 from .batch_analyzer import BatchAnalyzer
 
 
@@ -137,9 +137,9 @@ class CrawlerOrchestrator:
         results = {
             "total_snippets": len(snippets),
             "analyzed_snippets": [],
-            "total_vulnerabilities": 0,
-            "vulnerabilities_by_type": {},
-            "vulnerabilities_by_severity": {
+            "total_findings": 0,
+            "findings_by_type": {},
+            "findings_by_severity": {
                 "high": 0,
                 "medium": 0,
                 "low": 0,
@@ -154,20 +154,20 @@ class CrawlerOrchestrator:
                     "url": snippet.url,
                     "language": snippet.language,
                     "stars": snippet.stars,
-                    "vulnerabilities": [],
-                    "vulnerability_count": 0,
+                    "findings": [],
+                    "finding_count": 0,
                     "analysis_skipped": True,
                 }
             else:
                 snippet_result = self._analyze_snippet(snippet)
-                vuln_count = len(snippet_result.get("vulnerabilities", []))
-                results["total_vulnerabilities"] += vuln_count
-                for vuln in snippet_result.get("vulnerabilities", []):
-                    vuln_type = vuln.get("type", "unknown")
-                    severity = vuln.get("severity", "low")
-                    results["vulnerabilities_by_type"][vuln_type] = \
-                        results["vulnerabilities_by_type"].get(vuln_type, 0) + 1
-                    results["vulnerabilities_by_severity"][severity] += 1
+                finding_count = len(snippet_result.get("findings", []))
+                results["total_findings"] += finding_count
+                for finding in snippet_result.get("findings", []):
+                    finding_type = finding.get("type", "unknown")
+                    severity = finding.get("severity", "low")
+                    results["findings_by_type"][finding_type] = \
+                        results["findings_by_type"].get(finding_type, 0) + 1
+                    results["findings_by_severity"][severity] += 1
 
             results["analyzed_snippets"].append(snippet_result)
         
@@ -178,13 +178,13 @@ class CrawlerOrchestrator:
             
             findings = []
             for snippet_result in results["analyzed_snippets"]:
-                for vuln in snippet_result.get("vulnerabilities", []):
+                for finding in snippet_result.get("findings", []):
                     findings.append({
                         "repository": snippet_result["repository"],
                         "file": snippet_result["file_path"],
-                        "type": vuln.get("type"),
-                        "severity": vuln.get("severity"),
-                        "message": vuln.get("message"),
+                        "type": finding.get("type"),
+                        "severity": finding.get("severity"),
+                        "message": finding.get("message"),
                     })
             
             summary = self.llm_analyzer.summarize_findings(findings)
@@ -226,8 +226,8 @@ class CrawlerOrchestrator:
                 "url": snippet.url,
                 "language": snippet.language,
                 "stars": snippet.stars,
-                "vulnerabilities": analysis_result.get("vulnerabilities", []),
-                "vulnerability_count": analysis_result.get("vulnerability_count", 0),
+                "findings": analysis_result.get("findings", []),
+                "finding_count": analysis_result.get("finding_count", 0),
             }
             
             # Add LLM analysis if available
@@ -280,7 +280,7 @@ class CrawlerOrchestrator:
             "repository": repo_name,
             "total_snippets": len(snippets),
             "analyzed_snippets": [],
-            "total_vulnerabilities": 0,
+            "total_findings": 0,
         }
         
         for snippet in snippets:
@@ -291,13 +291,13 @@ class CrawlerOrchestrator:
                     "url": snippet.url,
                     "language": snippet.language,
                     "stars": snippet.stars,
-                    "vulnerabilities": [],
-                    "vulnerability_count": 0,
+                    "findings": [],
+                    "finding_count": 0,
                     "analysis_skipped": True,
                 }
             else:
                 snippet_result = self._analyze_snippet(snippet)
-                results["total_vulnerabilities"] += snippet_result.get("vulnerability_count", 0)
+                results["total_findings"] += snippet_result.get("finding_count", 0)
 
             results["analyzed_snippets"].append(snippet_result)
         
@@ -341,9 +341,9 @@ class CrawlerOrchestrator:
                 {
                     "repository": r.repository,
                     "files": r.files,
-                    "vulnerabilities": r.vulnerabilities,
-                    "total_vulnerabilities": r.total_vulnerabilities,
-                    "vulnerability_types": r.vulnerability_types,
+                    "findings": r.findings,
+                    "total_findings": r.total_findings,
+                    "finding_types": r.finding_types,
                     "severity_counts": r.severity_counts,
                     "has_source_to_sink_flows": r.has_source_to_sink_flows,
                     "analysis_metadata": r.analysis_metadata,
@@ -351,7 +351,7 @@ class CrawlerOrchestrator:
                 for r in batch_results.repositories
             ],
             "global_statistics": batch_results.global_statistics,
-            "unique_vulnerability_patterns": batch_results.unique_vulnerability_patterns,
+            "unique_finding_patterns": batch_results.unique_finding_patterns,
         }
         
         # Save results (uses organized structure if output_file is None)
@@ -394,17 +394,17 @@ class CrawlerOrchestrator:
         print(f"\nTotal snippets analyzed: {results.get('total_snippets', 0)}")
         print(f"Total vulnerabilities found: {results.get('total_vulnerabilities', 0)}")
         
-        severity = results.get('vulnerabilities_by_severity', {})
+        severity = results.get('findings_by_severity', {})
         print(f"\nBy Severity:")
         print(f"  High:   {severity.get('high', 0)}")
         print(f"  Medium: {severity.get('medium', 0)}")
         print(f"  Low:    {severity.get('low', 0)}")
         
-        vuln_types = results.get('vulnerabilities_by_type', {})
-        if vuln_types:
+        finding_types = results.get('findings_by_type', {})
+        if finding_types:
             print(f"\nBy Type:")
-            for vuln_type, count in sorted(vuln_types.items(), key=lambda x: x[1], reverse=True):
-                print(f"  {vuln_type}: {count}")
+            for finding_type, count in sorted(finding_types.items(), key=lambda x: x[1], reverse=True):
+                print(f"  {finding_type}: {count}")
         
         # Print LLM summary if available
         if 'llm_summary' in results:
@@ -413,29 +413,29 @@ class CrawlerOrchestrator:
             print("="*80)
             print(results['llm_summary'])
         
-        # Print top vulnerabilities
+        # Print top findings
         print(f"\n{'='*80}")
-        print("Top Vulnerabilities:")
+        print("Top Findings:")
         print("="*80)
         
-        top_vulns = []
+        top_findings = []
         for snippet_result in results.get('analyzed_snippets', []):
-            for vuln in snippet_result.get('vulnerabilities', []):
-                top_vulns.append({
+            for finding in snippet_result.get('findings', []):
+                top_findings.append({
                     'repository': snippet_result['repository'],
                     'file': snippet_result['file_path'],
-                    'severity': vuln.get('severity', 'low'),
-                    'type': vuln.get('type', 'unknown'),
-                    'message': vuln.get('message', ''),
+                    'severity': finding.get('severity', 'low'),
+                    'type': finding.get('type', 'unknown'),
+                    'message': finding.get('message', ''),
                     'url': snippet_result.get('url', ''),
                 })
         
         # Sort by severity
         severity_order = {'high': 3, 'medium': 2, 'low': 1}
-        top_vulns.sort(key=lambda x: severity_order.get(x['severity'], 0), reverse=True)
+        top_findings.sort(key=lambda x: severity_order.get(x['severity'], 0), reverse=True)
         
-        for i, vuln in enumerate(top_vulns[:10], 1):
-            print(f"\n{i}. [{vuln['severity'].upper()}] {vuln['repository']}/{vuln['file']}")
-            print(f"   Type: {vuln['type']}")
-            print(f"   {vuln['message'][:100]}...")
-            print(f"   URL: {vuln['url']}")
+        for i, finding in enumerate(top_findings[:10], 1):
+            print(f"\n{i}. [{finding['severity'].upper()}] {finding['repository']}/{finding['file']}")
+            print(f"   Type: {finding['type']}")
+            print(f"   {finding['message'][:100]}...")
+            print(f"   URL: {finding['url']}")

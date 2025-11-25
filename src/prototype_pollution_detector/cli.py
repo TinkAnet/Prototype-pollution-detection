@@ -106,7 +106,7 @@ Examples:
     crawl_parser.add_argument(
         "-o", "--output",
         type=str,
-        help="Output file for results (required for crawl)",
+        help="Output file for results (optional - uses organized structure if not specified)",
         default=None,
     )
     crawl_parser.add_argument(
@@ -128,8 +128,8 @@ Examples:
     batch_parser.add_argument(
         "-o", "--output",
         type=str,
-        help="Output file for results (default: batch_results.json)",
-        default="batch_results.json",
+        help="Output file for results (default: uses organized structure in results/batch/)",
+        default=None,
     )
     batch_parser.add_argument(
         "--max-files-per-repo",
@@ -295,11 +295,8 @@ def handle_batch_analyze(args) -> int:
     
     try:
         # Determine output file
-        if args.output:
-            output_file = Path(args.output)
-        else:
-            # Use organized structure
-            output_file = None
+        # If output is specified, use it; otherwise use organized structure
+        output_file = Path(args.output) if args.output else None
         
         # Analyze crawled sources
         results = orchestrator.analyze_crawled_sources(
@@ -311,11 +308,17 @@ def handle_batch_analyze(args) -> int:
         if args.output:
             print(f"\nBatch analysis complete. Results saved to {args.output}")
         else:
-            result_dir = path_manager.get_batch_result_dir()
-            print(f"\nBatch analysis complete. Results saved to {result_dir}")
-            print(f"  - Summary: {result_dir / 'summary.json'}")
-            print(f"  - Detailed: {result_dir / 'detailed.json'}")
-            print(f"  - Repositories: {result_dir / 'repositories.json'}")
+            # Get the actual result directory from the latest symlink
+            latest_link = path_manager.batch_results_dir / "latest"
+            if latest_link.exists() and latest_link.is_symlink():
+                actual_dir = latest_link.resolve()
+                print(f"\nBatch analysis complete. Results saved to organized structure:")
+                print(f"  Directory: {actual_dir}")
+                print(f"  - Summary (high-level stats): {actual_dir / 'summary.json'}")
+                print(f"  - Detailed (full vulnerability details): {actual_dir / 'detailed.json'}")
+                print(f"  - Repositories (JSONL format): {actual_dir / 'repositories.jsonl'}")
+            else:
+                print(f"\nBatch analysis complete. Results saved to organized structure in results/batch/")
         
         return 0
     
