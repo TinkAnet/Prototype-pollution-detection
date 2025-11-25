@@ -14,6 +14,7 @@ from .github_crawler import GitHubCrawler, CodeSnippet
 from .llm_analyzer import LLMAnalyzer
 from .detector import PrototypePollutionDetector
 from .analysis import Vulnerability
+from .batch_analyzer import BatchAnalyzer
 
 
 class CrawlerOrchestrator:
@@ -38,6 +39,7 @@ class CrawlerOrchestrator:
         self.github_crawler = GitHubCrawler(verbose=verbose)
         self.llm_analyzer = LLMAnalyzer(verbose=verbose)
         self.detector = PrototypePollutionDetector(verbose=verbose)
+        self.batch_analyzer = BatchAnalyzer(verbose=verbose)
     
     def crawl_and_analyze(
         self,
@@ -290,6 +292,67 @@ class CrawlerOrchestrator:
                 results["total_vulnerabilities"] += snippet_result.get("vulnerability_count", 0)
 
             results["analyzed_snippets"].append(snippet_result)
+        
+        return results
+    
+    def analyze_crawled_sources(
+        self,
+        sources_dir: Path,
+        max_files_per_repo: Optional[int] = None,
+        output_file: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """
+        Analyze already-crawled code sources using batch analyzer.
+        
+        This method is optimized for analyzing the crawler_sources directory,
+        providing better cross-file analysis and deduplication.
+        
+        Args:
+            sources_dir: Directory containing crawled sources
+            max_files_per_repo: Maximum files to analyze per repository
+            output_file: Optional output file path for results
+            
+        Returns:
+            Dictionary containing batch analysis results
+        """
+        if self.verbose:
+            print(f"Analyzing crawled sources in: {sources_dir}")
+        
+        # Use batch analyzer for optimized analysis
+        batch_results = self.batch_analyzer.analyze_crawler_sources(
+            sources_dir=sources_dir,
+            max_files_per_repo=max_files_per_repo,
+        )
+        
+        # Convert to dictionary format
+        results = {
+            "total_repositories": batch_results.total_repositories,
+            "total_files": batch_results.total_files,
+            "total_vulnerabilities": batch_results.total_vulnerabilities,
+            "repositories": [
+                {
+                    "repository": r.repository,
+                    "files": r.files,
+                    "vulnerabilities": r.vulnerabilities,
+                    "total_vulnerabilities": r.total_vulnerabilities,
+                    "vulnerability_types": r.vulnerability_types,
+                    "severity_counts": r.severity_counts,
+                    "has_source_to_sink_flows": r.has_source_to_sink_flows,
+                    "analysis_metadata": r.analysis_metadata,
+                }
+                for r in batch_results.repositories
+            ],
+            "global_statistics": batch_results.global_statistics,
+            "unique_vulnerability_patterns": batch_results.unique_vulnerability_patterns,
+        }
+        
+        # Save if output file specified
+        if output_file:
+            self.batch_analyzer.save_results(batch_results, output_file)
+        
+        # Print summary
+        if self.verbose:
+            self.batch_analyzer.print_summary(batch_results)
         
         return results
     

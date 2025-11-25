@@ -1,6 +1,6 @@
-# Prototype Pollution Detection Tool
+# PolluTaint
 
-A static analysis tool for detecting prototype pollution vulnerabilities in JavaScript and HTML files using semantic AST analysis and taint tracking.
+**PolluTaint** - A taint analysis tool for detecting prototype pollution vulnerabilities in JavaScript and HTML files using semantic AST analysis and cross-file data flow tracking.
 
 **Group Project** - Web Security Class at Johns Hopkins University  
 **Team:** Letao Zhao, Ethan Lee, Bingyan He, Qi Sun
@@ -52,23 +52,23 @@ Add your keys:
 
 ```bash
 # Single file
-prototype-pollution-detector analyze file.js
+pollutaint analyze file.js
 
 # Directory
-prototype-pollution-detector analyze src/
+pollutaint analyze src/
 
 # Save results
-prototype-pollution-detector analyze file.js -o results.json
+pollutaint analyze file.js -o results.json
 ```
 
 ### Crawl GitHub
 
 ```bash
 # Search GitHub
-prototype-pollution-detector crawl --max-results 50 -o results.json
+pollutaint crawl --max-results 50 -o results.json
 
 # Specific repository
-prototype-pollution-detector crawl --repo owner/repo -o results.json
+pollutaint crawl --repo owner/repo -o results.json
 ```
 
 ## What It Detects

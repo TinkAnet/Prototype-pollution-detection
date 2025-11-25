@@ -1,13 +1,15 @@
 """
 Main detector module that coordinates parsing and analysis.
 
-This module provides the high-level API for the prototype pollution
-detection tool.
+This module provides the high-level API for detecting prototype pollution
+vulnerabilities in JavaScript code. It coordinates the parsing of JavaScript
+files into abstract syntax trees and then analyzes those trees for security
+issues.
 """
 
 import json
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 
 from .parser import JavaScriptParser
 from .analysis import PrototypePollutionAnalyzer, Vulnerability
@@ -17,16 +19,24 @@ class PrototypePollutionDetector:
     """
     Main detector class for prototype pollution vulnerabilities.
     
-    This class coordinates the parsing and analysis of JavaScript code
-    to detect potential prototype pollution issues.
+    This class serves as the entry point for the detection tool. It coordinates
+    the parsing of JavaScript files into abstract syntax trees and then
+    analyzes those trees to find prototype pollution vulnerabilities.
+    
+    The detector can analyze individual files or entire directories, and it
+    supports cross-file analysis to track data flow across multiple files.
     """
     
     def __init__(self, verbose: bool = False):
         """
-        Initialize the detector.
+        Initialize the detector with a parser and analyzer.
+        
+        Creates the necessary components for parsing JavaScript code and
+        analyzing it for vulnerabilities. Both components share the same
+        verbosity setting.
         
         Args:
-            verbose: Enable verbose output
+            verbose: If True, print detailed progress information during analysis
         """
         self.verbose = verbose
         self.parser = JavaScriptParser(verbose=verbose)
@@ -34,16 +44,20 @@ class PrototypePollutionDetector:
     
     def analyze(self, path: Path) -> Dict[str, Any]:
         """
-        Analyze a JavaScript file or directory for prototype pollution.
+        Analyze a JavaScript file or directory for prototype pollution vulnerabilities.
+        
+        This is the main entry point for analysis. It automatically detects
+        whether the path is a file or directory and calls the appropriate
+        analysis method.
         
         Args:
-            path: Path to a JavaScript file or directory
+            path: Path to a JavaScript file or directory containing JavaScript files
             
         Returns:
-            Dictionary containing analysis results
+            Dictionary containing analysis results with vulnerabilities found
             
         Raises:
-            ValueError: If the path is invalid
+            ValueError: If the path doesn't exist or is neither a file nor directory
         """
         if path.is_file():
             return self._analyze_file(path)
@@ -54,18 +68,27 @@ class PrototypePollutionDetector:
     
     def _analyze_file(self, file_path: Path) -> Dict[str, Any]:
         """
-        Analyze a single JavaScript file.
+        Analyze a single JavaScript or HTML file for vulnerabilities.
+        
+        This method handles the analysis of a single file. It first checks
+        if the file type is supported, then parses it into an AST, and
+        finally analyzes the AST for prototype pollution vulnerabilities.
         
         Args:
-            file_path: Path to the JavaScript file
+            file_path: Path to the JavaScript or HTML file to analyze
             
         Returns:
-            Dictionary containing analysis results
+            Dictionary containing:
+            - file: Path to the analyzed file
+            - vulnerabilities: List of vulnerability dictionaries
+            - vulnerability_count: Number of vulnerabilities found
+            - skipped: True if file was skipped (with reason)
+            - error: Error message if analysis failed
         """
         if self.verbose:
             print(f"Analyzing file: {file_path}")
         
-        # Check file extension
+        # Only process supported file types
         if file_path.suffix not in {".js", ".jsx", ".mjs", ".cjs", ".html", ".htm"}:
             if self.verbose:
                 print(f"Skipping unsupported file: {file_path}")
@@ -76,12 +99,13 @@ class PrototypePollutionDetector:
             }
         
         try:
-            # Parse the file
+            # Parse the file into an abstract syntax tree
             ast = self.parser.parse_file(file_path)
             
-            # Analyze for vulnerabilities
+            # Analyze the AST for prototype pollution vulnerabilities
             vulnerabilities = self.analyzer.analyze_ast(ast)
             
+            # Convert vulnerability objects to dictionaries for JSON serialization
             return {
                 "file": str(file_path),
                 "vulnerabilities": [
@@ -99,6 +123,7 @@ class PrototypePollutionDetector:
             }
         
         except Exception as e:
+            # If analysis fails, return error information instead of crashing
             return {
                 "file": str(file_path),
                 "error": str(e),
@@ -108,11 +133,19 @@ class PrototypePollutionDetector:
         """
         Analyze all JavaScript files in a directory recursively.
         
+        This method performs a two-pass analysis:
+        1. First pass: Analyze each file individually and collect ASTs
+        2. Second pass: Perform cross-file taint analysis to find vulnerabilities
+           where data flows from sources in one file to sinks in another
+        
         Args:
-            dir_path: Path to the directory
+            dir_path: Path to the directory containing JavaScript files
             
         Returns:
-            Dictionary containing analysis results for all files
+            Dictionary containing:
+            - directory: Path to the analyzed directory
+            - files: List of analysis results for each file
+            - total_vulnerabilities: Total number of vulnerabilities found across all files
         """
         if self.verbose:
             print(f"Analyzing directory: {dir_path}")
@@ -123,37 +156,39 @@ class PrototypePollutionDetector:
             "total_vulnerabilities": 0,
         }
         
-        # Find all JavaScript and HTML files
+        # Find all JavaScript and HTML files recursively
         js_files = []
         for pattern in ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.html", "**/*.htm"]:
             js_files.extend(dir_path.glob(pattern))
         
-        # First pass: Analyze each file and collect ASTs
+        # First pass: Analyze each file individually
+        # This collects ASTs and finds file-local vulnerabilities
         for js_file in js_files:
             file_result = self._analyze_file(js_file)
             results["files"].append(file_result)
         
         # Second pass: Perform cross-file taint analysis
+        # This finds vulnerabilities where data flows across file boundaries
         self.analyzer.finalize_analysis()
         
-        # Update results with final vulnerabilities
+        # Get all vulnerabilities found (including cross-file ones)
         final_vulns = self.analyzer.vulnerabilities
         results["total_vulnerabilities"] = len(final_vulns)
         
-        # Update file results with final vulnerabilities
-        # Match vulnerabilities to files by checking which AST they came from
+        # Update each file's results with the final vulnerability list
+        # We match vulnerabilities to files using the file path stored in each vulnerability
         for file_result in results["files"]:
             file_path = file_result.get("file", "")
             file_vulns = []
             for v in final_vulns:
-                # Check if vulnerability belongs to this file
-                # We'll match by checking if the file path matches
-                # (vulnerabilities store file info in their context)
+                # Match vulnerabilities to files by checking the file attribute
                 if hasattr(v, 'file') and v.file == file_path:
                     file_vulns.append(v)
+                # Fallback: check if file path appears in code snippet or message
                 elif file_path in str(v.code_snippet) or file_path in v.message:
                     file_vulns.append(v)
             
+            # Update the file result with matched vulnerabilities
             file_result["vulnerabilities"] = [
                 {
                     "severity": v.severity,
@@ -173,8 +208,12 @@ class PrototypePollutionDetector:
         """
         Print analysis results to stdout in a human-readable format.
         
+        This method formats the analysis results nicely for console output,
+        making it easy to see which files have vulnerabilities and what
+        those vulnerabilities are.
+        
         Args:
-            results: Analysis results dictionary
+            results: Analysis results dictionary from analyze() method
         """
         if "directory" in results:
             print(f"\n=== Analysis Results for {results['directory']} ===\n")
@@ -186,13 +225,13 @@ class PrototypePollutionDetector:
                     continue
                 
                 if "error" in file_result:
-                    print(f"❌ {file_result['file']}: Error - {file_result['error']}")
+                    print(f"[ERROR] {file_result['file']}: Error - {file_result['error']}")
                 elif file_result["vulnerability_count"] > 0:
-                    print(f"⚠️  {file_result['file']}: {file_result['vulnerability_count']} vulnerability(ies)")
+                    print(f"[WARNING] {file_result['file']}: {file_result['vulnerability_count']} vulnerability(ies)")
                     for vuln in file_result["vulnerabilities"]:
                         print(f"   [{vuln['severity'].upper()}] Line {vuln['line']}: {vuln['message']}")
                 else:
-                    print(f"✅ {file_result['file']}: No vulnerabilities detected")
+                    print(f"[OK] {file_result['file']}: No vulnerabilities detected")
         else:
             # Single file result
             if results.get("skipped"):
@@ -215,9 +254,13 @@ class PrototypePollutionDetector:
         """
         Save analysis results to a JSON file.
         
+        This method serializes the analysis results to JSON format, making
+        it easy to process the results programmatically or share them with
+        other tools.
+        
         Args:
-            results: Analysis results dictionary
-            output_path: Path to save the results
+            results: Analysis results dictionary from analyze() method
+            output_path: Path where the JSON file should be saved
         """
         with open(output_path, "w") as f:
             json.dump(results, f, indent=2)

@@ -27,13 +27,13 @@ Get token: https://github.com/settings/tokens
 ### Analyze Files
 
 ```bash
-prototype-pollution-detector analyze examples/unsafe_extend.js
+pollutaint analyze examples/unsafe_extend.js
 ```
 
 ### Crawl GitHub
 
 ```bash
-prototype-pollution-detector crawl --max-results 20 -o results.json
+pollutaint crawl --max-results 20 -o results.json
 ```
 
 ## Common Issues

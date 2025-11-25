@@ -23,8 +23,8 @@ def main(argv: Optional[list] = None) -> int:
         Exit code (0 for success, non-zero for failure)
     """
     parser = argparse.ArgumentParser(
-        prog="prototype-pollution-detector",
-        description="Detect client-side prototype pollution vulnerabilities in JavaScript code",
+        prog="pollutaint",
+        description="Taint analysis tool for detecting prototype pollution vulnerabilities in JavaScript code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -114,6 +114,34 @@ Examples:
         help="Enable verbose output",
     )
     
+    # Batch analyze command
+    batch_parser = subparsers.add_parser(
+        "batch-analyze",
+        help="Analyze already-crawled code sources with optimized batch processing"
+    )
+    batch_parser.add_argument(
+        "sources_dir",
+        type=str,
+        help="Directory containing crawled sources (organized by repository)",
+    )
+    batch_parser.add_argument(
+        "-o", "--output",
+        type=str,
+        help="Output file for results (default: batch_results.json)",
+        default="batch_results.json",
+    )
+    batch_parser.add_argument(
+        "--max-files-per-repo",
+        type=int,
+        help="Maximum files to analyze per repository (default: no limit)",
+        default=None,
+    )
+    batch_parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
+    
     # Global arguments
     parser.add_argument(
         "--version",
@@ -140,6 +168,8 @@ Examples:
         return handle_analyze(args)
     elif args.command == "crawl":
         return handle_crawl(args)
+    elif args.command == "batch-analyze":
+        return handle_batch_analyze(args)
     else:
         parser.print_help()
         return 1
@@ -218,6 +248,44 @@ def handle_crawl(args) -> int:
         # Print summary
         orchestrator.print_results(results)
         
+        return 0
+    
+    except KeyboardInterrupt:
+        print("\nInterrupted by user", file=sys.stderr)
+        return 130
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        return 1
+
+
+def handle_batch_analyze(args) -> int:
+    """Handle the batch-analyze command."""
+    # Validate input path
+    sources_dir = Path(args.sources_dir)
+    if not sources_dir.exists():
+        print(f"Error: Sources directory '{args.sources_dir}' does not exist", file=sys.stderr)
+        return 1
+    
+    if not sources_dir.is_dir():
+        print(f"Error: '{args.sources_dir}' is not a directory", file=sys.stderr)
+        return 1
+    
+    # Create orchestrator
+    orchestrator = CrawlerOrchestrator(verbose=args.verbose)
+    
+    try:
+        # Analyze crawled sources
+        results = orchestrator.analyze_crawled_sources(
+            sources_dir=sources_dir,
+            max_files_per_repo=args.max_files_per_repo,
+            output_file=Path(args.output),
+        )
+        
+        print(f"\nBatch analysis complete. Results saved to {args.output}")
         return 0
     
     except KeyboardInterrupt:

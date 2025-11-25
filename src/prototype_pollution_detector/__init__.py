@@ -1,7 +1,8 @@
 """
-Prototype Pollution Detection Tool
+PolluTaint - Taint Analysis Tool for Prototype Pollution Detection
 
-A tool for detecting client-side prototype pollution vulnerabilities in JavaScript code.
+A static analysis tool for detecting prototype pollution vulnerabilities in JavaScript code
+using semantic AST analysis and taint tracking.
 """
 
 __version__ = "0.2.0"

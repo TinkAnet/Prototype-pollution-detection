@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "prototype-pollution-detector"
+name = "pollutaint"
 version = "0.1.0"
-description = "A tool for detecting client-side prototype pollution vulnerabilities in JavaScript code"
+description = "Taint analysis tool for detecting prototype pollution vulnerabilities in JavaScript code"
 readme = "README.md"
 authors = [
     {name = "Letao Zhao"},
@@ -44,7 +44,7 @@ dev = [
 ]
 
 [project.scripts]
-prototype-pollution-detector = "prototype_pollution_detector.cli:main"
+pollutaint = "prototype_pollution_detector.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/TinkAnet/Prototype-pollution-detection"
