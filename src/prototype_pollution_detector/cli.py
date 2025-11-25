@@ -10,6 +10,7 @@ from typing import Optional
 from .detector import PrototypePollutionDetector
 from .crawler_orchestrator import CrawlerOrchestrator
 from .config import config
+from .paths import get_path_manager
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -196,7 +197,14 @@ def handle_analyze(args) -> int:
             detector.save_results(results, output_path)
             print(f"Results saved to {args.output}")
         else:
-            detector.print_results(results)
+            # Use organized structure if no output specified
+            path_manager = get_path_manager()
+            input_name = input_path.name if input_path.is_file() else input_path.name
+            output_path = path_manager.get_analyze_result_file(input_name)
+            detector.save_results(results, output_path)
+            print(f"Results saved to {output_path}")
+        
+        detector.print_results(results)
         
         return 0
     
@@ -210,12 +218,9 @@ def handle_analyze(args) -> int:
 
 def handle_crawl(args) -> int:
     """Handle the crawl command."""
-    if not args.output:
-        print("Error: --output is required for crawl command", file=sys.stderr)
-        return 1
-    
     # Create orchestrator
-    orchestrator = CrawlerOrchestrator(verbose=args.verbose)
+    path_manager = get_path_manager()
+    orchestrator = CrawlerOrchestrator(verbose=args.verbose, path_manager=path_manager)
     
     try:
         if args.repo:
@@ -232,6 +237,7 @@ def handle_crawl(args) -> int:
             # General GitHub search
             if args.verbose:
                 print("Starting GitHub crawl...")
+                print(f"Crawled sources will be saved to: {path_manager.get_crawl_sources_dir()}")
             
             results = orchestrator.crawl_and_analyze(
                 max_results=args.max_results,
@@ -242,11 +248,20 @@ def handle_crawl(args) -> int:
             )
         
         # Save results
-        output_path = Path(args.output)
-        orchestrator.save_results(results, output_path)
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            # Use organized structure
+            output_path = None
+        
+        saved_path = orchestrator.save_results(results, output_path)
         
         # Print summary
         orchestrator.print_results(results)
+        
+        if args.verbose:
+            print(f"\nCrawl session directory: {orchestrator.github_crawler.crawl_session_dir}")
+            print(f"Results directory: {saved_path.parent}")
         
         return 0
     
@@ -274,18 +289,34 @@ def handle_batch_analyze(args) -> int:
         print(f"Error: '{args.sources_dir}' is not a directory", file=sys.stderr)
         return 1
     
-    # Create orchestrator
-    orchestrator = CrawlerOrchestrator(verbose=args.verbose)
+    # Create orchestrator with path manager
+    path_manager = get_path_manager()
+    orchestrator = CrawlerOrchestrator(verbose=args.verbose, path_manager=path_manager)
     
     try:
+        # Determine output file
+        if args.output:
+            output_file = Path(args.output)
+        else:
+            # Use organized structure
+            output_file = None
+        
         # Analyze crawled sources
         results = orchestrator.analyze_crawled_sources(
             sources_dir=sources_dir,
             max_files_per_repo=args.max_files_per_repo,
-            output_file=Path(args.output),
+            output_file=output_file,
         )
         
-        print(f"\nBatch analysis complete. Results saved to {args.output}")
+        if args.output:
+            print(f"\nBatch analysis complete. Results saved to {args.output}")
+        else:
+            result_dir = path_manager.get_batch_result_dir()
+            print(f"\nBatch analysis complete. Results saved to {result_dir}")
+            print(f"  - Summary: {result_dir / 'summary.json'}")
+            print(f"  - Detailed: {result_dir / 'detailed.json'}")
+            print(f"  - Repositories: {result_dir / 'repositories.json'}")
+        
         return 0
     
     except KeyboardInterrupt:

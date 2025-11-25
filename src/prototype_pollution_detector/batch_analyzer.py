@@ -50,15 +50,23 @@ class BatchAnalyzer:
     - Identifies unique vulnerability patterns
     """
     
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, path_manager=None):
         """
         Initialize the batch analyzer.
         
         Args:
             verbose: Enable verbose output
+            path_manager: PathManager instance. If None, creates a new one.
         """
         self.verbose = verbose
         self.detector = PrototypePollutionDetector(verbose=verbose)
+        
+        # Use PathManager for organized directory structure
+        if path_manager is None:
+            from .paths import get_path_manager
+            path_manager = get_path_manager()
+        
+        self.path_manager = path_manager
         
         # Deduplication tracking
         self._vulnerability_signatures: Set[str] = set()
@@ -435,17 +443,45 @@ class BatchAnalyzer:
     def save_results(
         self,
         results: BatchAnalysisResult,
-        output_file: Path,
+        output_path: Optional[Path] = None,
         format: str = "json",
-    ) -> None:
+    ) -> Path:
         """
-        Save batch analysis results to file.
+        Save batch analysis results to organized directory structure.
         
         Args:
-            results: BatchAnalysisResult to save
-            output_file: Output file path
+            results: BatchAnalysisResult object
+            output_path: Optional output path. If None, uses organized structure.
             format: Output format ("json" or "jsonl")
+            
+        Returns:
+            Path to the saved results file
         """
+        if output_path is None:
+            # Use organized structure
+            result_dir = self.path_manager.get_batch_result_dir()
+            output_path = result_dir / "summary.json"
+            
+            # Also save detailed results
+            detailed_file = result_dir / "detailed.json"
+            with open(detailed_file, 'w', encoding='utf-8') as f:
+                json.dump(asdict(results), f, indent=2, ensure_ascii=False)
+            
+            # Save repositories separately for easier access
+            repos_file = result_dir / "repositories.json"
+            repos_data = {
+                "total_repositories": results.total_repositories,
+                "total_files": results.total_files,
+                "total_vulnerabilities": results.total_vulnerabilities,
+                "repositories": [asdict(r) for r in results.repositories],
+            }
+            with open(repos_file, 'w', encoding='utf-8') as f:
+                json.dump(repos_data, f, indent=2, ensure_ascii=False)
+            
+            # Create symlink to latest
+            self.path_manager.create_latest_symlink(result_dir, "latest")
+        
+        # Save summary
         if format == "json":
             # Convert to dictionary
             results_dict = {
@@ -457,17 +493,19 @@ class BatchAnalyzer:
                 "unique_vulnerability_patterns": results.unique_vulnerability_patterns,
             }
             
-            with open(output_file, 'w', encoding='utf-8') as f:
+            with open(output_path, 'w', encoding='utf-8') as f:
                 json.dump(results_dict, f, indent=2, ensure_ascii=False)
         
         elif format == "jsonl":
             # Save as JSONL (one repository per line)
-            with open(output_file, 'w', encoding='utf-8') as f:
+            with open(output_path, 'w', encoding='utf-8') as f:
                 for repo in results.repositories:
                     f.write(json.dumps(asdict(repo), ensure_ascii=False) + '\n')
         
         if self.verbose:
-            print(f"Results saved to {output_file}")
+            print(f"Results saved to {output_path}")
+        
+        return output_path
     
     def print_summary(self, results: BatchAnalysisResult) -> None:
         """

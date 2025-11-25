@@ -47,4 +47,5 @@ pollutaint crawl --max-results 20 -o results.json
 ## Next Steps
 
 - Read [README.md](README.md) for full documentation
-- Check [examples/](examples/) for sample vulnerable code
+- See [STRUCTURE.md](STRUCTURE.md) for directory organization
+- Check [VULNERABILITY_EXAMPLE.md](VULNERABILITY_EXAMPLE.md) for vulnerability examples

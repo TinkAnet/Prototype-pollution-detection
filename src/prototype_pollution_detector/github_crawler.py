@@ -92,16 +92,28 @@ class GitHubCrawler:
         r'data-\w+-options',
     ]
     
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, path_manager=None):
         """
         Initialize the GitHub crawler.
         
         Args:
             verbose: Enable verbose output
+            path_manager: PathManager instance. If None, creates a new one.
         """
         self.verbose = verbose
         self.github = None
-        self.code_output_dir = Path.cwd() / "crawler_sources"
+        
+        # Use PathManager for organized directory structure
+        if path_manager is None:
+            from .paths import get_path_manager
+            path_manager = get_path_manager()
+        
+        self.path_manager = path_manager
+        # Get the latest crawl session or create a new one
+        self.crawl_session_dir = path_manager.get_crawl_session_dir()
+        self.code_output_dir = path_manager.get_crawl_sources_dir(
+            self.crawl_session_dir.name
+        )
         
         if Github is None:
             if verbose:

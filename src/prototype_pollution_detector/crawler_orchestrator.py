@@ -28,15 +28,23 @@ class CrawlerOrchestrator:
     4. Generate comprehensive report
     """
     
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, path_manager=None):
         """
         Initialize the orchestrator.
         
         Args:
             verbose: Enable verbose output
+            path_manager: PathManager instance. If None, creates a new one.
         """
         self.verbose = verbose
-        self.github_crawler = GitHubCrawler(verbose=verbose)
+        
+        # Use PathManager for organized directory structure
+        if path_manager is None:
+            from .paths import get_path_manager
+            path_manager = get_path_manager()
+        
+        self.path_manager = path_manager
+        self.github_crawler = GitHubCrawler(verbose=verbose, path_manager=path_manager)
         self.llm_analyzer = LLMAnalyzer(verbose=verbose)
         self.detector = PrototypePollutionDetector(verbose=verbose)
         self.batch_analyzer = BatchAnalyzer(verbose=verbose)
@@ -346,9 +354,11 @@ class CrawlerOrchestrator:
             "unique_vulnerability_patterns": batch_results.unique_vulnerability_patterns,
         }
         
-        # Save if output file specified
-        if output_file:
-            self.batch_analyzer.save_results(batch_results, output_file)
+        # Save results (uses organized structure if output_file is None)
+        saved_path = self.batch_analyzer.save_results(batch_results, output_file)
+        
+        if output_file is None and self.verbose:
+            print(f"\nResults saved to organized structure: {saved_path.parent}")
         
         # Print summary
         if self.verbose:

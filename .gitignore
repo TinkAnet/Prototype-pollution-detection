@@ -213,3 +213,12 @@ test_results.json
 crawl_results.json
 repo_results.json
 crawler_sources/
+
+# Organized structure (data and results directories)
+data/
+results/
+logs/
+
+# macOS system files
+.DS_Store
+**/.DS_Store

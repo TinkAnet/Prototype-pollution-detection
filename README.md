@@ -164,23 +164,15 @@ results = detector.analyze(Path("file.js"))
 detector.print_results(results)
 ```
 
-## Examples
-
-See `examples/` directory for complete test cases:
-
-- `example1_client_side_json_parse/` - Client-side JSON.parse source to merge sink
-- `example2_server_side_nodejs/` - Server-side Node.js request parsing to merge sink
-- `example3_mixed_html_js/` - Mixed HTML and JavaScript with DOM sources
-- `example4_dom_chain/` - Complex DOM attribute extraction to merge sink
-- `example5_express_server/` - Express.js server with request body parsing
-
-Each example demonstrates source-to-sink data flow across different files, showing how the tool detects taint propagation.
-
 ## Documentation
 
 - [Quick Start Guide](QUICKSTART.md) - Get started quickly
-- [Detection Logic](DETECTION_LOGIC.md) - How detection works
-- [Design Document](DESIGN.md) - Architecture details
+- [Rebuild and Run Guide](REBUILD_AND_RUN.md) - How to rebuild and run the project
+- [Directory Structure](STRUCTURE.md) - Organized data and results structure
+- [Migration Guide](MIGRATION_GUIDE.md) - Migrating from old structure
+- [Analysis Improvements](ANALYSIS_IMPROVEMENTS.md) - Technical improvements
+- [Batch Analysis Guide](BATCH_ANALYSIS_GUIDE.md) - Batch analysis workflow
+- [Vulnerability Example](VULNERABILITY_EXAMPLE.md) - Example vulnerability analysis
 
 ## Contributing
 
