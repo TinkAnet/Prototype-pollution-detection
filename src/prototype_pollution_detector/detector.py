@@ -186,13 +186,13 @@ class PrototypePollutionDetector:
                     continue
                 
                 if "error" in file_result:
-                    print(f"❌ {file_result['file']}: Error - {file_result['error']}")
+                    print(f"[-] {file_result['file']}: Error - {file_result['error']}")
                 elif file_result["vulnerability_count"] > 0:
-                    print(f"⚠️  {file_result['file']}: {file_result['vulnerability_count']} vulnerability(ies)")
+                    print(f"[!]  {file_result['file']}: {file_result['vulnerability_count']} vulnerability(ies)")
                     for vuln in file_result["vulnerabilities"]:
                         print(f"   [{vuln['severity'].upper()}] Line {vuln['line']}: {vuln['message']}")
                 else:
-                    print(f"✅ {file_result['file']}: No vulnerabilities detected")
+                    print(f"[+] {file_result['file']}: No vulnerabilities detected")
         else:
             # Single file result
             if results.get("skipped"):

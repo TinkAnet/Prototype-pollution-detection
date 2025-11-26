@@ -64,16 +64,37 @@ class PrototypePollutionAnalyzer:
         """
         self.verbose = verbose
         self.vulnerabilities: List[Vulnerability] = []
-        self.sources: List[Dict[str, Any]] = []  # Track data sources globally
-        self.tainted_vars: Dict[str, Dict[str, Any]] = {}  # Track tainted variables: {var_name: {source_info}}
-        self.function_calls: List[Dict[str, Any]] = []  # Track function calls for taint propagation
-        self.all_asts: List[Dict[str, Any]] = []  # Store all ASTs for cross-file analysis
+        self.sources: List[Dict[str, Any]] = []
+        self.tainted_vars: Dict[Tuple[str, str], Dict[str, Any]] = {}  # (file, var_name) -> source_info
+        self.function_calls: List[Dict[str, Any]] = []
+        self.all_asts: List[Dict[str, Any]] = []
+        
+        # NEW: Track tainted property-name variables (keys in for-in/Object.keys loops)
+        self.tainted_keys: Dict[Tuple[str, str], Dict[str, Any]] = {}  # (file, key_var) -> source_info
         
         # Indexing for performance
-        self.parent_map: Dict[int, Dict[str, Any]] = {}  # child-id -> parent-node
-        self.func_index: Dict[str, List[Dict[str, Any]]] = {}  # name -> [{"node": <fn node>, "file": str}]
-        self.sink_function_names: Set[str] = set()  # names known to contain sinks
-        self._seen_vulns: Set[Tuple[str, int, int, str]] = set()  # (file, line, col, type) for dedup
+        self.parent_map: Dict[int, Dict[str, Any]] = {}
+        self.func_index: Dict[str, List[Dict[str, Any]]] = {}
+        self.sink_function_names: Set[str] = set()
+        self._seen_vulns: Set[Tuple[str, int, int, str]] = set()
+    
+    def reset(self) -> None:
+        """
+        Reset analyzer state for a new analysis run.
+        
+        Call this between analyses to prevent state bleeding across projects.
+        Alternatively, create a new analyzer instance per project.
+        """
+        self.vulnerabilities = []
+        self.sources = []
+        self.tainted_vars = {}
+        self.tainted_keys = {}
+        self.function_calls = []
+        self.all_asts = []
+        self.parent_map = {}
+        self.func_index = {}
+        self.sink_function_names = set()
+        self._seen_vulns = set()
     
     def analyze_ast(self, ast: Dict[str, Any]) -> List[Vulnerability]:
         """
@@ -161,12 +182,6 @@ class PrototypePollutionAnalyzer:
     def _analyze_javascript_code(self, ast: Dict[str, Any]) -> None:
         """
         Analyze ALL functions in JavaScript code for prototype pollution vulnerabilities.
-        
-        Checks every function to see if its logic is vulnerable, not just functions
-        with suspicious names. Now includes source detection and data flow tracking.
-        
-        Args:
-            ast: Parsed JavaScript AST dictionary
         """
         # NEW: Index parent pointers + functions and precompute sinks once
         self._index_ast(ast)
@@ -177,13 +192,15 @@ class PrototypePollutionAnalyzer:
         # Step 2: Track initial taint (variable assignments from sources)
         self._track_initial_taint(ast)
         
+        # NEW: Track key taint (loop variables that iterate over tainted objects)
+        self._track_key_taint(ast)
+        
         # Step 3: Extract function calls for taint propagation
         self._extract_function_calls(ast)
         
         # Step 4: Analyze ALL functions for vulnerabilities (sinks)
         functions = ast.get("functions", [])
         for func in functions:
-            # Check if this function's logic is vulnerable to prototype pollution
             self._check_function_vulnerability(func, ast)
         
         # Step 5: Check for direct dangerous property assignments
@@ -221,7 +238,7 @@ class PrototypePollutionAnalyzer:
         # Build function index & precompute which functions contain sinks
         funcs = ast.get("functions", [])
         for f in funcs:
-            node = f.get("ast_node") or self._traverse_ast_for_function(ast, f.get("name", ""), f.get("line", 0))
+            node = f.get("ast_node") or self._traverse_ast_for_function(root, f.get("name", ""), f.get("line", 0))
             if not node:
                 continue
             
@@ -351,7 +368,7 @@ class PrototypePollutionAnalyzer:
                     }
                     self.sources.append(source_info)
         
-        # Detect form input access
+            # Detect form input access
         elif node_type == "MemberExpression":
             prop_name = self._get_property_name_from_ast(node)
             if prop_name in ("value", "textContent", "innerHTML"):
@@ -369,6 +386,37 @@ class PrototypePollutionAnalyzer:
                         "node": node,
                     }
                     self.sources.append(source_info)
+            
+            # Detect Node.js/Express sources (req.body, req.query, req.params)
+            obj_name = self._get_object_name_from_ast(node)
+            if obj_name in ("req", "request") and prop_name in ("body", "query", "params", "headers"):
+                variable_name = self._get_assigned_variable(node, parent)
+                source_info = {
+                    "type": f"express_{prop_name}",
+                    "line": node.get("loc", {}).get("start", {}).get("line"),
+                    "column": node.get("loc", {}).get("start", {}).get("column"),
+                    "variable": variable_name,
+                    "property": prop_name,
+                    "object": obj_name,
+                    "file": filename,
+                    "node": node,
+                }
+                self.sources.append(source_info)
+            
+            # Detect browser sources (location.search, location.hash)
+            if obj_name == "location" and prop_name in ("search", "hash", "href"):
+                variable_name = self._get_assigned_variable(node, parent)
+                source_info = {
+                    "type": "url_param",
+                    "line": node.get("loc", {}).get("start", {}).get("line"),
+                    "column": node.get("loc", {}).get("start", {}).get("column"),
+                    "variable": variable_name,
+                    "property": prop_name,
+                    "object": obj_name,
+                    "file": filename,
+                    "node": node,
+                }
+                self.sources.append(source_info)
         
         # Recursively search children with parent context
         for key, value in node.items():
@@ -449,6 +497,116 @@ class PrototypePollutionAnalyzer:
             return
         
         self._extract_variable_assignments(ast_root, ast.get("file", "unknown"))
+    
+    def _track_key_taint(self, ast: Dict[str, Any]) -> None:
+        """
+        Track variables that are used as property keys when iterating over tainted objects.
+        
+        Examples:
+            for (const key in src) { target[key] = src[key]; }
+            for (const key of Object.keys(src)) { ... }
+        
+        Args:
+            ast: Parsed AST dictionary
+        """
+        ast_root = ast.get("ast")
+        if not ast_root:
+            return
+        
+        self._find_key_taint(ast_root, ast.get("file", "unknown"))
+    
+    def _find_key_taint(self, node: Any, filename: str) -> None:
+        """
+        Recursively find patterns that make a variable a tainted 'key' variable.
+        
+        Args:
+            node: AST node to analyze
+            filename: Current filename
+        """
+        if not isinstance(node, dict):
+            return
+        
+        ntype = node.get("type")
+        
+        # Pattern 1: for (key in src) { ... }
+        if ntype == "ForInStatement":
+            left = node.get("left")
+            right = node.get("right")
+            
+            # Right side is the object being iterated
+            src_name = None
+            if isinstance(right, dict) and right.get("type") == "Identifier":
+                src_name = right.get("name")
+            
+            if src_name and (filename, src_name) in self.tainted_vars:
+                # Left side is the loop variable
+                key_name = None
+                if isinstance(left, dict):
+                    if left.get("type") == "VariableDeclaration":
+                        decls = left.get("declarations") or []
+                        if decls:
+                            did = decls[0].get("id", {})
+                            if did.get("type") == "Identifier":
+                                key_name = did.get("name")
+                    elif left.get("type") == "Identifier":
+                        key_name = left.get("name")
+                
+                if key_name:
+                    src_taint = self.tainted_vars[(filename, src_name)]
+                    self.tainted_keys[(filename, key_name)] = {
+                        "source_type": src_taint.get("source_type", "unknown"),
+                        "source_line": src_taint.get("source_line"),
+                        "source_file": src_taint.get("source_file", filename),
+                        "tainted_from": src_name,
+                        "tainted_at": "for_in",
+                    }
+        
+        # Pattern 2: for (key of Object.keys(src)) { ... }
+        elif ntype == "ForOfStatement":
+            left = node.get("left")
+            right = node.get("right")
+            
+            key_name = None
+            if isinstance(left, dict):
+                if left.get("type") == "VariableDeclaration":
+                    decls = left.get("declarations") or []
+                    if decls:
+                        did = decls[0].get("id", {})
+                        if did.get("type") == "Identifier":
+                            key_name = did.get("name")
+                elif left.get("type") == "Identifier":
+                    key_name = left.get("name")
+            
+            src_name = None
+            if isinstance(right, dict) and right.get("type") == "CallExpression":
+                callee = right.get("callee", {})
+                callee_name = self._get_function_name_from_ast(callee)
+                
+                if callee_name and (callee_name == "Object.keys" or callee_name.endswith(".keys")):
+                    args = right.get("arguments") or []
+                    if args and args[0].get("type") == "Identifier":
+                        src_name = args[0].get("name")
+            
+            if key_name and src_name and (filename, src_name) in self.tainted_vars:
+                src_taint = self.tainted_vars[(filename, src_name)]
+                self.tainted_keys[(filename, key_name)] = {
+                    "source_type": src_taint.get("source_type", "unknown"),
+                    "source_line": src_taint.get("source_line"),
+                    "source_file": src_taint.get("source_file", filename),
+                    "tainted_from": src_name,
+                    "tainted_at": "for_of_object_keys",
+                }
+        
+        # Recurse
+        for k, v in node.items():
+            if k in ("loc", "range", "leadingComments", "trailingComments"):
+                continue
+            if isinstance(v, dict):
+                self._find_key_taint(v, filename)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        self._find_key_taint(item, filename)
     
     def _extract_function_calls(self, ast: Dict[str, Any]) -> None:
         """
@@ -571,7 +729,7 @@ class PrototypePollutionAnalyzer:
                     
                     if callee_name == "JSON.parse":
                         # Mark variable as tainted
-                        self.tainted_vars[var_name] = {
+                        self.tainted_vars[(filename, var_name)] = {
                             "source_type": "json_parse",
                             "source_line": init.get("loc", {}).get("start", {}).get("line"),
                             "source_file": filename,
@@ -580,7 +738,7 @@ class PrototypePollutionAnalyzer:
                         self._update_source_variable(init, var_name)
                     
                     elif callee_name and ("getAttribute" in callee_name or "dataset" in callee_name):
-                        self.tainted_vars[var_name] = {
+                        self.tainted_vars[(filename, var_name)] = {
                             "source_type": "dom_attribute",
                             "source_line": init.get("loc", {}).get("start", {}).get("line"),
                             "source_file": filename,
@@ -589,7 +747,7 @@ class PrototypePollutionAnalyzer:
                         self._update_source_variable(init, var_name)
                     
                     elif callee_name and "querySelector" in callee_name:
-                        self.tainted_vars[var_name] = {
+                        self.tainted_vars[(filename, var_name)] = {
                             "source_type": "dom_query",
                             "source_line": init.get("loc", {}).get("start", {}).get("line"),
                             "source_file": filename,
@@ -603,7 +761,7 @@ class PrototypePollutionAnalyzer:
                     obj = init.get("object", {})
                     prop = init.get("property", {})
                     if prop.get("type") == "Identifier" and prop.get("name") in ("getAttribute", "dataset"):
-                        self.tainted_vars[var_name] = {
+                        self.tainted_vars[(filename, var_name)] = {
                             "source_type": "dom_attribute",
                             "source_line": init.get("loc", {}).get("start", {}).get("line"),
                             "source_file": filename,
@@ -613,11 +771,18 @@ class PrototypePollutionAnalyzer:
                 # Check if init is a tainted variable (taint propagation)
                 elif init.get("type") == "Identifier":
                     init_var = init.get("name")
-                    if init_var in self.tainted_vars:
+                    if (filename, init_var) in self.tainted_vars:
                         # Propagate taint
-                        self.tainted_vars[var_name] = self.tainted_vars[init_var].copy()
-                        self.tainted_vars[var_name]["tainted_at"] = "assignment"
-                        self.tainted_vars[var_name]["propagated_from"] = init_var
+                        self.tainted_vars[(filename, var_name)] = self.tainted_vars[(filename, init_var)].copy()
+                        self.tainted_vars[(filename, var_name)]["tainted_at"] = "assignment"
+                        self.tainted_vars[(filename, var_name)]["propagated_from"] = init_var
+                    
+                    # NEW: Key-taint propagation for variable declarations
+                    if (filename, init_var) in self.tainted_keys:
+                        key_taint = self.tainted_keys[(filename, init_var)].copy()
+                        key_taint["tainted_at"] = "assignment"
+                        key_taint["propagated_from"] = init_var
+                        self.tainted_keys[(filename, var_name)] = key_taint
         
         # Track assignment expressions: x = JSON.parse(...)
         elif node_type == "AssignmentExpression":
@@ -633,7 +798,7 @@ class PrototypePollutionAnalyzer:
                     callee_name = self._get_function_name_from_ast(callee)
                     
                     if callee_name == "JSON.parse":
-                        self.tainted_vars[var_name] = {
+                        self.tainted_vars[(filename, var_name)] = {
                             "source_type": "json_parse",
                             "source_line": right.get("loc", {}).get("start", {}).get("line"),
                             "source_file": filename,
@@ -642,7 +807,7 @@ class PrototypePollutionAnalyzer:
                         self._update_source_variable(right, var_name)
                     
                     elif callee_name and ("getAttribute" in callee_name or "dataset" in callee_name):
-                        self.tainted_vars[var_name] = {
+                        self.tainted_vars[(filename, var_name)] = {
                             "source_type": "dom_attribute",
                             "source_line": right.get("loc", {}).get("start", {}).get("line"),
                             "source_file": filename,
@@ -653,11 +818,18 @@ class PrototypePollutionAnalyzer:
                 # Check if right side is a tainted variable (taint propagation)
                 elif right.get("type") == "Identifier":
                     right_var = right.get("name")
-                    if right_var in self.tainted_vars:
+                    if (filename, right_var) in self.tainted_vars:
                         # Propagate taint
-                        self.tainted_vars[var_name] = self.tainted_vars[right_var].copy()
-                        self.tainted_vars[var_name]["tainted_at"] = "assignment"
-                        self.tainted_vars[var_name]["propagated_from"] = right_var
+                        self.tainted_vars[(filename, var_name)] = self.tainted_vars[(filename, right_var)].copy()
+                        self.tainted_vars[(filename, var_name)]["tainted_at"] = "assignment"
+                        self.tainted_vars[(filename, var_name)]["propagated_from"] = right_var
+                    
+                    # NEW: Key-taint propagation for assignments
+                    if (filename, right_var) in self.tainted_keys:
+                        key_taint = self.tainted_keys[(filename, right_var)].copy()
+                        key_taint["tainted_at"] = "assignment"
+                        key_taint["propagated_from"] = right_var
+                        self.tainted_keys[(filename, var_name)] = key_taint
         
         # Recursively search children
         for key, value in node.items():
@@ -718,15 +890,19 @@ class PrototypePollutionAnalyzer:
             
             # Enhance message with source information if available
             source_info = analysis_result.get("source_info")
-            if source_info:
+            has_key_taint = analysis_result.get("has_key_taint", False)  # Should be passed from _analyze_function_ast if implemented fully there
+            
+            # Check if we have message already constructed in analysis_result
+            if analysis_result.get("message"):
+                message = analysis_result.get("message")
+            elif source_info:
                 message = (
                     f"Function '{func_display_name}' performs property copying/merging "
                     f"with data from {source_info['type']} source (line {source_info['line']}) "
                     f"without validating dangerous properties. This creates a prototype pollution vulnerability."
                 )
             else:
-                message = analysis_result.get("message", 
-                    f"Function '{func_display_name}' is vulnerable to prototype pollution.")
+                message = f"Function '{func_display_name}' is vulnerable to prototype pollution."
             
             code_snippet = func.get("body", "")[:300] if func.get("body") else ""
             
@@ -820,6 +996,7 @@ class PrototypePollutionAnalyzer:
             "message": "",
             "vulnerability_type": "",
             "source_info": None,
+            "has_key_taint": False,  # NEW: Pass this up
         }
         
         func_body = func_node.get("body", {})
@@ -836,14 +1013,26 @@ class PrototypePollutionAnalyzer:
         if sink_analysis["has_sink"]:
             has_validation = sink_analysis["has_validation"]
             is_recursive = sink_analysis["is_recursive"]
+            has_key_taint = sink_analysis.get("has_key_taint", False)
+            result["has_key_taint"] = has_key_taint  # Store in result
             
             # Check if source data flows to this function
             source_info = self._check_source_to_sink_flow(func_body, param_names, ast)
             
             if not has_validation:
                 result["is_vulnerable"] = True
-                result["severity"] = "high" if source_info else "high"
-                result["vulnerability_type"] = "vulnerable_recursive_merge" if is_recursive else "vulnerable_property_assignment"
+                
+                # NEW: Bump severity when key names are tainted or when we have source->sink info
+                if has_key_taint or source_info:
+                    result["severity"] = "high"
+                else:
+                    result["severity"] = "medium"
+                
+                if is_recursive:
+                    result["vulnerability_type"] = "vulnerable_recursive_merge"
+                else:
+                    result["vulnerability_type"] = "vulnerable_property_assignment"
+                
                 result["source_info"] = source_info
                 
                 if source_info:
@@ -852,6 +1041,13 @@ class PrototypePollutionAnalyzer:
                         f"Function '{func_name if func_name else '(anonymous)'}' receives data from "
                         f"{source_info['type']} source and performs property copying/merging "
                         f"without validating dangerous properties. This creates a prototype pollution vulnerability."
+                    )
+                elif has_key_taint:  # NEW
+                    result["message"] = (
+                        f"Function '{func_name if func_name else '(anonymous)'}' copies properties using a key "
+                        f"variable that comes from a tainted object (e.g., for-in over user-controlled data) "
+                        f"without validating dangerous properties (__proto__, constructor, prototype). "
+                        f"This is a strong prototype pollution candidate."
                     )
                 else:
                     result["message"] = (
@@ -894,14 +1090,27 @@ class PrototypePollutionAnalyzer:
             # Print tainted variables
             if self.tainted_vars:
                 print("\n  Tainted variables:")
-                for var_name, taint_info in self.tainted_vars.items():
+                for (file_name, var_name), taint_info in self.tainted_vars.items():
                     source_type = taint_info.get('source_type', 'unknown')
                     source_line = taint_info.get('source_line', '?')
                     source_file = taint_info.get('source_file', 'unknown')
                     tainted_at = taint_info.get('tainted_at', 'unknown')
                     propagated_from = taint_info.get('propagated_from')
                     prop_info = f" (propagated from '{propagated_from}')" if propagated_from else ""
-                    print(f"    - '{var_name}': {source_type} source at line {source_line} in {source_file} ({tainted_at}){prop_info}")
+                    print(f"    - '{var_name}' in {file_name}: {source_type} source at line {source_line} in {source_file} ({tainted_at}){prop_info}")
+            
+            # Print tainted keys (property name variables)
+            if self.tainted_keys:
+                print("\n  Tainted keys (property names from tainted objects):")
+                for (file_name, key_name), taint_info in self.tainted_keys.items():
+                    source_type = taint_info.get('source_type', 'unknown')
+                    source_line = taint_info.get('source_line', '?')
+                    source_file = taint_info.get('source_file', 'unknown')
+                    tainted_at = taint_info.get('tainted_at', 'unknown')
+                    tainted_from = taint_info.get('tainted_from', 'unknown')
+                    propagated_from = taint_info.get('propagated_from')
+                    prop_info = f" (propagated from '{propagated_from}')" if propagated_from else f" (from '{tainted_from}')"
+                    print(f"    - '{key_name}' in {file_name}: {source_type} source at line {source_line} in {source_file} ({tainted_at}){prop_info}")
             
             # Print function calls with tainted arguments
             tainted_calls = [c for c in self.function_calls if c.get('tainted')]
@@ -956,12 +1165,12 @@ class PrototypePollutionAnalyzer:
                             "source_file": call.get("file"),
                         }
                     })
-                elif arg_var and arg_var in self.tainted_vars:
+                elif arg_var and (call.get("file", ""), arg_var) in self.tainted_vars:
                     # Tainted variable passed as argument
                     tainted_args.append({
                         "variable": arg_var,
                         "is_direct_source": False,
-                        "taint_info": self.tainted_vars[arg_var]
+                        "taint_info": self.tainted_vars[(call.get("file", ""), arg_var)]
                     })
             
             # If function is a sink and receives tainted data, mark it
@@ -995,6 +1204,9 @@ class PrototypePollutionAnalyzer:
     def _check_tainted_sinks(self) -> None:
         """
         Check sinks for tainted data and create source-to-sink vulnerabilities.
+        
+        Creates new vulnerabilities for tainted sink calls even if no existing
+        function-level vulnerability exists (e.g., top-level code).
         """
         # Check function calls that are sinks and receive tainted data
         for call in self.function_calls:
@@ -1006,6 +1218,7 @@ class PrototypePollutionAnalyzer:
                     call_file = call.get("file")
                     
                     # Find corresponding vulnerability for this sink function
+                    matched = False
                     for vuln in self.vulnerabilities:
                         # Match by function name in message or by checking if it's the sink function
                         if func_name and (func_name.lower() in vuln.message.lower() or 
@@ -1047,7 +1260,38 @@ class PrototypePollutionAnalyzer:
                                 )
                             
                             vuln.vulnerability_type = "source_to_sink_pollution"
+                            matched = True
                             break
+                    
+                    # If no matching vulnerability found, create a new one for this tainted sink call
+                    if not matched:
+                        taint_arg = tainted_args[0]
+                        taint_info = taint_arg["taint_info"]
+                        
+                        if taint_arg.get("is_direct_source"):
+                            message = (
+                                f"Call to '{func_name}' at line {call_line} receives tainted data "
+                                f"directly from {taint_info.get('source_type', 'unknown')} source. "
+                                f"This may cause prototype pollution."
+                            )
+                        else:
+                            var_info = f"via variable '{taint_arg.get('variable')}'" if taint_arg.get("variable") else ""
+                            message = (
+                                f"Call to '{func_name}' at line {call_line} receives tainted data "
+                                f"from {taint_info.get('source_type', 'unknown')} source "
+                                f"(line {taint_info.get('source_line')} in {taint_info.get('source_file')}) {var_info}. "
+                                f"This may cause prototype pollution."
+                            )
+                        
+                        self._add_vuln(
+                            severity="high",
+                            line=call_line or 0,
+                            column=0,
+                            message=message,
+                            code_snippet="",
+                            vulnerability_type="source_to_sink_pollution",
+                            file=call_file or "",
+                        )
     
     def _vulnerability_matches_function(self, vuln: Vulnerability, func_name: str) -> bool:
         """
@@ -1082,10 +1326,12 @@ class PrototypePollutionAnalyzer:
         Returns:
             Source information if flow detected, None otherwise
         """
+        filename = ast.get("file", "")
+        
         # Check if any parameter is tainted
         for param_name in param_names:
-            if param_name in self.tainted_vars:
-                taint_info = self.tainted_vars[param_name]
+            if (filename, param_name) in self.tainted_vars:
+                taint_info = self.tainted_vars[(filename, param_name)]
                 return {
                     "type": taint_info.get("source_type", "unknown"),
                     "line": taint_info.get("source_line"),
@@ -1096,8 +1342,8 @@ class PrototypePollutionAnalyzer:
         # Check if function body uses tainted variables
         used_vars = self._extract_variable_usage(func_body)
         for var_name in used_vars:
-            if var_name in self.tainted_vars:
-                taint_info = self.tainted_vars[var_name]
+            if (filename, var_name) in self.tainted_vars:
+                taint_info = self.tainted_vars[(filename, var_name)]
                 return {
                     "type": taint_info.get("source_type", "unknown"),
                     "line": taint_info.get("source_line"),
@@ -1191,6 +1437,8 @@ class PrototypePollutionAnalyzer:
             "has_validation": False,
             "has_partial_validation": False,
             "is_recursive": False,
+            # NEW: Track if key variable is tainted
+            "has_key_taint": False,
         }
         
         if not isinstance(node, dict):
@@ -1221,6 +1469,10 @@ class PrototypePollutionAnalyzer:
                     guards = self._is_guarded(node, key_name=key_name)
                     result["has_validation"] = guards["full"]
                     result["has_partial_validation"] = guards["partial"]
+                    
+                    # NEW: If the key variable itself is tainted, mark key taint
+                    if key_name and key_name in self.tainted_keys:
+                        result["has_key_taint"] = True
         
         # 2) Call-based sinks
         elif ntype == "CallExpression":
@@ -1261,6 +1513,8 @@ class PrototypePollutionAnalyzer:
                 result["has_validation"] |= child["has_validation"]
                 result["has_partial_validation"] |= child["has_partial_validation"]
                 result["is_recursive"] |= child["is_recursive"]
+                # NEW: Propagate key taint
+                result["has_key_taint"] |= child.get("has_key_taint", False)
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
@@ -1269,6 +1523,8 @@ class PrototypePollutionAnalyzer:
                         result["has_validation"] |= child["has_validation"]
                         result["has_partial_validation"] |= child["has_partial_validation"]
                         result["is_recursive"] |= child["is_recursive"]
+                        # NEW: Propagate key taint
+                        result["has_key_taint"] |= child.get("has_key_taint", False)
         
         return result
     
@@ -1276,7 +1532,7 @@ class PrototypePollutionAnalyzer:
         """
         Walk ancestors and determine whether the sink is dominated by:
         - A full exclusion check: key !== "__proto__" && key !== "constructor" && key !== "prototype"
-        - Or an own-property check: foo.hasOwnProperty(key) OR Object.prototype.hasOwnProperty.call(foo, key)
+        - Or an own-property check: foo.hasOwnProperty(key) OR Object.prototype.hasOwnProperty.call(foo, key) (counts as partial)
         
         Returns {"full": bool, "partial": bool}
         
@@ -1309,8 +1565,9 @@ class PrototypePollutionAnalyzer:
                     partial = True
                 
                 if self._if_test_has_hasOwnProperty(test, key_name):
-                    # hasOwnProperty guard is considered full (prevents proto chain keys)
-                    full = True
+                    # hasOwnProperty prevents prototype chain keys but doesn't exclude
+                    # dangerous own properties like "__proto__", so treat as partial
+                    partial = True
             
             cur = parent
         
@@ -1436,89 +1693,6 @@ class PrototypePollutionAnalyzer:
                 return f"{obj.get('name')}.{prop.get('name')}"
         
         return None
-    
-    def _check_validation_in_ast(self, node: Any) -> Dict[str, bool]:
-        """
-        Check if AST node contains validation for dangerous properties.
-        
-        Args:
-            node: AST node to check
-            
-        Returns:
-            Dictionary with validation check results
-        """
-        result = {
-            "has_full_validation": False,
-            "has_partial_validation": False,
-        }
-        
-        if not isinstance(node, dict):
-            return result
-        
-        node_type = node.get("type")
-        
-        # Check for binary expressions comparing to dangerous properties
-        if node_type == "BinaryExpression":
-            operator = node.get("operator")
-            if operator in ("===", "!==", "==", "!="):
-                left = node.get("left", {})
-                right = node.get("right", {})
-                
-                # Check if comparing to dangerous property string
-                left_val = self._get_string_value_from_ast(left)
-                right_val = self._get_string_value_from_ast(right)
-                
-                dangerous_found = []
-                for prop in self.DANGEROUS_PROPERTIES:
-                    if prop in (left_val, right_val):
-                        dangerous_found.append(prop)
-                
-                if len(dangerous_found) == len(self.DANGEROUS_PROPERTIES):
-                    result["has_full_validation"] = True
-                elif len(dangerous_found) > 0:
-                    result["has_partial_validation"] = True
-        
-        # Check for CallExpression to hasOwnProperty
-        elif node_type == "CallExpression":
-            callee = node.get("callee", {})
-            callee_name = self._get_function_name_from_ast(callee)
-            if "hasOwnProperty" in (callee_name or ""):
-                result["has_full_validation"] = True
-        
-        # Recursively check children
-        for key, value in node.items():
-            if key in ("loc", "range", "leadingComments", "trailingComments"):
-                continue
-            if isinstance(value, dict):
-                child_result = self._check_validation_in_ast(value)
-                result["has_full_validation"] = result["has_full_validation"] or child_result["has_full_validation"]
-                result["has_partial_validation"] = result["has_partial_validation"] or child_result["has_partial_validation"]
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        child_result = self._check_validation_in_ast(item)
-                        result["has_full_validation"] = result["has_full_validation"] or child_result["has_full_validation"]
-                        result["has_partial_validation"] = result["has_partial_validation"] or child_result["has_partial_validation"]
-        
-        return result
-    
-    def _get_string_value_from_ast(self, node: Dict[str, Any]) -> Optional[str]:
-        """
-        Extract string value from AST node.
-        
-        Args:
-            node: AST node
-            
-        Returns:
-            String value or None
-        """
-        if node.get("type") == "Literal":
-            return str(node.get("value", ""))
-        elif node.get("type") == "Identifier":
-            return node.get("name")
-        
-        return None
-    
     
     def get_vulnerability_report(self) -> Dict[str, Any]:
         """
