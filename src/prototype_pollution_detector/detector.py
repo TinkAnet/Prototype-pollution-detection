@@ -11,6 +11,7 @@ from typing import Dict, List, Any, Optional
 
 from .parser import JavaScriptParser
 from .analysis import PrototypePollutionAnalyzer, Vulnerability
+from .validate import DynamicValidator
 
 
 class PrototypePollutionDetector:
@@ -31,13 +32,15 @@ class PrototypePollutionDetector:
         self.verbose = verbose
         self.parser = JavaScriptParser(verbose=verbose)
         self.analyzer = PrototypePollutionAnalyzer(verbose=verbose)
+        self.dynamic_validator = DynamicValidator(verbose=verbose)
     
-    def analyze(self, path: Path) -> Dict[str, Any]:
+    def analyze(self, path: Path, dynamic_verify: bool = False) -> Dict[str, Any]:
         """
         Analyze a JavaScript file or directory for prototype pollution.
         
         Args:
             path: Path to a JavaScript file or directory
+            dynamic_verify: Whether to attempt dynamic verification of vulnerabilities
             
         Returns:
             Dictionary containing analysis results
@@ -46,18 +49,19 @@ class PrototypePollutionDetector:
             ValueError: If the path is invalid
         """
         if path.is_file():
-            return self._analyze_file(path)
+            return self._analyze_file(path, dynamic_verify)
         elif path.is_dir():
-            return self._analyze_directory(path)
+            return self._analyze_directory(path, dynamic_verify)
         else:
             raise ValueError(f"Invalid path: {path}")
     
-    def _analyze_file(self, file_path: Path) -> Dict[str, Any]:
+    def _analyze_file(self, file_path: Path, dynamic_verify: bool = False) -> Dict[str, Any]:
         """
         Analyze a single JavaScript file.
         
         Args:
             file_path: Path to the JavaScript file
+            dynamic_verify: Whether to attempt dynamic verification
             
         Returns:
             Dictionary containing analysis results
@@ -82,7 +86,7 @@ class PrototypePollutionDetector:
             # Analyze for vulnerabilities
             vulnerabilities = self.analyzer.analyze_ast(ast)
             
-            return {
+            result = {
                 "file": str(file_path),
                 "vulnerabilities": [
                     {
@@ -97,6 +101,21 @@ class PrototypePollutionDetector:
                 ],
                 "vulnerability_count": len(vulnerabilities),
             }
+            
+            # Perform dynamic verification if requested
+            if dynamic_verify:
+                if self.verbose:
+                    print(f"Performing dynamic verification for {file_path}")
+                
+                # We usually only want to dynamically verify if it looks like a library 
+                # or if static analysis found something, but for now we can run it if requested.
+                dynamic_result = self.dynamic_validator.validate(file_path)
+                result["dynamic_verification"] = dynamic_result
+                
+                if dynamic_result.get("vulnerable"):
+                     result["confirmed_vulnerable"] = True
+            
+            return result
         
         except Exception as e:
             return {
@@ -104,12 +123,13 @@ class PrototypePollutionDetector:
                 "error": str(e),
             }
     
-    def _analyze_directory(self, dir_path: Path) -> Dict[str, Any]:
+    def _analyze_directory(self, dir_path: Path, dynamic_verify: bool = False) -> Dict[str, Any]:
         """
         Analyze all JavaScript files in a directory recursively.
         
         Args:
             dir_path: Path to the directory
+            dynamic_verify: Whether to attempt dynamic verification
             
         Returns:
             Dictionary containing analysis results for all files
@@ -128,12 +148,15 @@ class PrototypePollutionDetector:
         for pattern in ["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.html", "**/*.htm"]:
             js_files.extend(dir_path.glob(pattern))
         
-        # First pass: Analyze each file and collect ASTs
+        # First pass: Analyze each file
         for js_file in js_files:
-            file_result = self._analyze_file(js_file)
+            file_result = self._analyze_file(js_file, dynamic_verify)
             results["files"].append(file_result)
+            if file_result.get("vulnerability_count", 0) > 0:
+                 # Static analysis updates are handled here, but cross-file is separate
+                 pass
         
-        # Second pass: Perform cross-file taint analysis
+        # Second pass: Perform cross-file taint analysis (static only for now)
         self.analyzer.finalize_analysis()
         
         # Update results with final vulnerabilities
@@ -141,14 +164,14 @@ class PrototypePollutionDetector:
         results["total_vulnerabilities"] = len(final_vulns)
         
         # Update file results with final vulnerabilities
-        # Match vulnerabilities to files by checking which AST they came from
         for file_result in results["files"]:
             file_path = file_result.get("file", "")
+            
+            # If we already have results, we update the vulnerability list
+            # Be careful not to overwrite dynamic verification results
+            
             file_vulns = []
             for v in final_vulns:
-                # Check if vulnerability belongs to this file
-                # We'll match by checking if the file path matches
-                # (vulnerabilities store file info in their context)
                 if hasattr(v, 'file') and v.file == file_path:
                     file_vulns.append(v)
                 elif file_path in str(v.code_snippet) or file_path in v.message:
@@ -179,37 +202,59 @@ class PrototypePollutionDetector:
         if "directory" in results:
             print(f"\n=== Analysis Results for {results['directory']} ===\n")
             print(f"Files analyzed: {len(results['files'])}")
-            print(f"Total vulnerabilities found: {results['total_vulnerabilities']}\n")
+            print(f"Total vulnerabilities found (Static): {results['total_vulnerabilities']}\n")
             
             for file_result in results["files"]:
-                if file_result.get("skipped"):
-                    continue
-                
-                if "error" in file_result:
-                    print(f"[-] {file_result['file']}: Error - {file_result['error']}")
-                elif file_result["vulnerability_count"] > 0:
-                    print(f"[!]  {file_result['file']}: {file_result['vulnerability_count']} vulnerability(ies)")
-                    for vuln in file_result["vulnerabilities"]:
-                        print(f"   [{vuln['severity'].upper()}] Line {vuln['line']}: {vuln['message']}")
-                else:
-                    print(f"[+] {file_result['file']}: No vulnerabilities detected")
+                self._print_single_file_result(file_result)
         else:
             # Single file result
-            if results.get("skipped"):
-                print(f"Skipped: {results['reason']}")
-            elif "error" in results:
-                print(f"Error: {results['error']}")
+            self._print_single_file_result(results, header=True)
+
+    def _print_single_file_result(self, result: Dict[str, Any], header: bool = False) -> None:
+        """Helper to print result for a single file."""
+        file_path = result.get("file", "Unknown")
+        
+        if header:
+            print(f"\n=== Analysis Results for {file_path} ===\n")
+            
+        if result.get("skipped"):
+            if header: print(f"Skipped: {result['reason']}")
+            return
+            
+        if "error" in result:
+            print(f"[-] {file_path}: Error - {result['error']}")
+            return
+
+        vuln_count = result.get("vulnerability_count", 0)
+        dynamic = result.get("dynamic_verification")
+        
+        status_symbol = "[+]"
+        status_msg = "No vulnerabilities detected"
+        
+        if vuln_count > 0:
+            status_symbol = "[!]"
+            status_msg = f"{vuln_count} vulnerability(ies) (Static)"
+        
+        if dynamic:
+            if dynamic.get("vulnerable"):
+                status_symbol = "[!!!]"
+                status_msg += " | CONFIRMED VULNERABLE via Dynamic Check"
+            elif dynamic.get("error"):
+                 status_msg += f" | Dynamic Check Failed: {dynamic['error']}"
             else:
-                print(f"\n=== Analysis Results for {results['file']} ===\n")
-                print(f"Vulnerabilities found: {results['vulnerability_count']}\n")
+                 status_msg += " | Dynamic Check: Safe/Not Vulnerable"
+        
+        print(f"{status_symbol} {file_path}: {status_msg}")
                 
-                for vuln in results["vulnerabilities"]:
-                    print(f"[{vuln['severity'].upper()}] Line {vuln['line']}, Column {vuln['column']}")
-                    print(f"Type: {vuln['type']}")
-                    print(f"Message: {vuln['message']}")
-                    if vuln['code_snippet']:
-                        print(f"Code: {vuln['code_snippet']}")
-                    print()
+        for vuln in result.get("vulnerabilities", []):
+            print(f"   [{vuln['severity'].upper()}] Line {vuln['line']}: {vuln['message']}")
+            if header and vuln['code_snippet']:
+                print(f"     Code: {vuln['code_snippet']}")
+        
+        if header and dynamic:
+             print(f"\nDynamic Verification Output:\n{dynamic.get('output', '')}")
+             if dynamic.get('error'):
+                 print(f"Error: {dynamic['error']}")
     
     def save_results(self, results: Dict[str, Any], output_path: Path) -> None:
         """

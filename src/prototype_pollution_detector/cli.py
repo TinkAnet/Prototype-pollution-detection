@@ -57,6 +57,11 @@ Examples:
         default=None,
     )
     analyze_parser.add_argument(
+        "-d", "--dynamic",
+        action="store_true",
+        help="Enable dynamic verification (executes code)",
+    )
+    analyze_parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose output",
@@ -158,7 +163,7 @@ def handle_analyze(args) -> int:
     
     try:
         # Analyze the provided path
-        results = detector.analyze(input_path)
+        results = detector.analyze(input_path, dynamic_verify=args.dynamic)
         
         # Output results
         if args.output:
