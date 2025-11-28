@@ -64,9 +64,15 @@ class CrawlerOrchestrator:
         
         # Step 1: Search GitHub
         print(f"Step 1: Searching GitHub for vulnerable code patterns...")
+        print(f"  Target: {max_results} code snippets")
+        print(f"  Note: Will search and validate more results, then limit to {max_results} for analysis")
+        
+        # Search for more results than needed to ensure we have enough after filtering
+        # But limit the total processing to avoid excessive time
+        search_limit = max_results * 3 if max_results else None  # Get 3x to account for filtering
         
         snippets = self.github_crawler.search_vulnerable_code(
-            max_results=max_results * 2,  # Get more to filter
+            max_results=search_limit,  # Limit search to avoid excessive processing
             languages=languages,
             min_stars=min_stars
         )
@@ -95,9 +101,15 @@ class CrawlerOrchestrator:
                 for snippet in snippets
             ]
             
+            # LLM分析数量等于max_results，确保分析足够的结果
+            llm_analyze_count = max_results if len(snippet_dicts) >= max_results else len(snippet_dicts)
+            
+            if self.verbose:
+                print(f"  Analyzing {llm_analyze_count} snippets with LLM (target: {max_results})")
+            
             filtered = self.llm_analyzer.filter_vulnerable_snippets(
                 snippet_dicts,
-                max_analyze=min(max_results, len(snippet_dicts))
+                max_analyze=llm_analyze_count
             )
             
             # Reconstruct snippets from filtered results
@@ -108,6 +120,15 @@ class CrawlerOrchestrator:
                     if snippet.url == item.get("url"):
                         filtered_snippets.append(snippet)
                         break
+            
+            # 如果LLM过滤后不够max_results个，从剩余的snippets中补足
+            if len(filtered_snippets) < max_results and len(snippets) > len(filtered_snippets):
+                # 获取已分析的URL集合
+                analyzed_urls = {item.get("url") for item in filtered}
+                # 从未分析的snippets中补足
+                remaining_snippets = [s for s in snippets if s.url not in analyzed_urls]
+                needed = max_results - len(filtered_snippets)
+                filtered_snippets.extend(remaining_snippets[:needed])
             
             snippets = filtered_snippets[:max_results]
             

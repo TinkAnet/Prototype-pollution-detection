@@ -149,13 +149,45 @@ class GitHubCrawler:
             def _search():
                 search_query = f"{query} language:{language}"
                 results = self.github.search_code(search_query)
-                return list(results[:50])  # Limit to first 50 results
+                # Limit to first 100 results to avoid pagination and 403 errors
+                # GitHub API allows up to 1000, but pagination can trigger 403
+                # Using 100 is safer and still provides good coverage
+                try:
+                    # Get first page only (up to 100 results per page)
+                    limited_results = []
+                    for i, result in enumerate(results):
+                        if i >= 100:  # Limit to 100 results per query
+                            break
+                        limited_results.append(result)
+                    return limited_results
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  Error during result iteration: {e}")
+                    # Fallback: try to get first 100 directly
+                    try:
+                        return list(results[:100])
+                    except:
+                        return []
             search_func = _search
         else:
             def _search():
                 search_query = f"{query} language:{language}"
                 results = self.github.search_code(search_query)
-                return list(results[:50])
+                # Limit to first 100 results to avoid pagination
+                try:
+                    limited_results = []
+                    for i, result in enumerate(results):
+                        if i >= 100:  # Limit to 100 results per query
+                            break
+                        limited_results.append(result)
+                    return limited_results
+                except Exception as e:
+                    if self.verbose:
+                        print(f"  Error during result iteration: {e}")
+                    try:
+                        return list(results[:100])
+                    except:
+                        return []
             search_func = _search
         
         try:
@@ -163,23 +195,43 @@ class GitHubCrawler:
         
         except RateLimitExceededException:
             if self.verbose:
-                print("GitHub rate limit exceeded. Waiting 60 seconds...")
+                print("  GitHub rate limit exceeded. Waiting 60 seconds...")
+            else:
+                print("  Rate limit exceeded, waiting...", flush=True)
             time.sleep(60)
             return []
         
         except GithubException as e:
-            if self.verbose:
-                error_msg = str(e)
-                if "401" in error_msg or "Requires authentication" in error_msg:
-                    print(f"GitHub API error: {e}")
+            error_msg = str(e)
+            if "403" in error_msg or "Forbidden" in error_msg:
+                if self.verbose:
+                    print(f"  GitHub API 403 Forbidden: {e}")
+                    print("  This may be due to:")
+                    print("    - Rate limiting (too many requests)")
+                    print("    - Token permissions (check token scopes)")
+                    print("    - GitHub API restrictions")
+                else:
+                    print("  403 Forbidden (rate limit or permissions issue)", flush=True)
+                # Wait before retrying
+                time.sleep(30)
+                return []
+            elif "401" in error_msg or "Requires authentication" in error_msg:
+                if self.verbose:
+                    print(f"  GitHub API error: {e}")
                     print("  GitHub code search requires authentication. Please add GITHUB_TOKEN to .env")
                 else:
-                    print(f"GitHub API error: {e}")
-            return []
+                    print("  Authentication required", flush=True)
+                return []
+            else:
+                if self.verbose:
+                    print(f"  GitHub API error: {e}")
+                else:
+                    print(f"  API error: {str(e)[:50]}...", flush=True)
+                return []
     
     def search_vulnerable_code(
         self,
-        max_results: int = 100,
+        max_results: Optional[int] = None,
         languages: List[str] = None,
         min_stars: int = 0
     ) -> List[CodeSnippet]:
@@ -187,7 +239,7 @@ class GitHubCrawler:
         Search GitHub for potentially vulnerable code snippets.
         
         Args:
-            max_results: Maximum number of results to return
+            max_results: Maximum number of results to return (None = no limit, process all)
             languages: List of languages to search (default: ['javascript', 'typescript'])
             min_stars: Minimum repository stars (default: 0)
             
@@ -202,23 +254,41 @@ class GitHubCrawler:
         
         snippets = []
         seen_urls: Set[str] = set()
+        total_processed = 0
+        total_validated = 0
+        
+        total_patterns = len(self.SEARCH_PATTERNS) * len(languages)
+        current_pattern = 0
         
         for pattern in self.SEARCH_PATTERNS:
-            if len(snippets) >= max_results:
+            # Only check max_results if it's set
+            if max_results is not None and len(snippets) >= max_results:
                 break
             
             for language in languages:
+                current_pattern += 1
                 if self.verbose:
-                    print(f"Searching for: {pattern} in {language}")
+                    print(f"[{current_pattern}/{total_patterns}] Searching for: {pattern} in {language}")
+                else:
+                    print(f"[{current_pattern}/{total_patterns}] {pattern} ({language})...", end=" ", flush=True)
                 
                 results = self._rate_limited_search(pattern, language)
                 
-                if self.verbose:
-                    print(f"  Found {len(results)} search results")
+                if not self.verbose:
+                    print(f"Found {len(results)} results, validated: {len(snippets)}", flush=True)
+                elif self.verbose:
+                    print(f"  Found {len(results)} search results from GitHub")
                 
                 for result in results:
-                    if len(snippets) >= max_results:
+                    # Only check max_results if it's set
+                    if max_results is not None and len(snippets) >= max_results:
                         break
+                    
+                    total_processed += 1
+                    
+                    # Progress update every 100 results
+                    if total_processed % 100 == 0 and not self.verbose:
+                        print(f"  Processed {total_processed} results, validated {len(snippets)} snippets...", flush=True)
                     
                     # Skip if we've seen this URL before
                     if result.html_url in seen_urls:
@@ -244,6 +314,8 @@ class GitHubCrawler:
                             print(f"  Skipping {result.path} - doesn't match patterns")
                         continue
                     
+                    total_validated += 1
+                    
                     # Extract relevant code snippet (context around match)
                     snippet_code = self._extract_snippet(code, result.path)
                     
@@ -264,12 +336,23 @@ class GitHubCrawler:
                     snippets.append(snippet)
                     
                     if self.verbose:
-                        print(f"Found snippet: {snippet.repository}/{snippet.file_path}")
+                        print(f"  ✓ Validated snippet {total_validated}: {snippet.repository}/{snippet.file_path}")
                 
                 # Rate limiting delay
                 time.sleep(1)
         
-        return snippets[:max_results]
+        print(f"\nSearch completed: Processed {total_processed} results, validated {total_validated} snippets")
+        if self.verbose:
+            print(f"Summary: Processed {total_processed} results, validated {total_validated} snippets")
+        
+        # Return all snippets if max_results is None, otherwise limit
+        if max_results is None:
+            return snippets
+        else:
+            limited = snippets[:max_results]
+            if len(snippets) > max_results:
+                print(f"Limited to {max_results} snippets (found {len(snippets)} total)")
+            return limited
     
     def search_repository(
         self,
