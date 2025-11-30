@@ -11,25 +11,27 @@ from dataclasses import dataclass
 
 
 @dataclass
-class Vulnerability:
+class Finding:
     """
-    Represents a detected prototype pollution vulnerability.
+    Represents a detected prototype pollution finding.
+    A finding may be a confirmed vulnerability or a suspicious pattern requiring review.
     """
     severity: str  # 'high', 'medium', 'low'
     line: int
     column: int
     message: str
     code_snippet: str
-    vulnerability_type: str
-    file: str = ""  # File where vulnerability was found
+    finding_type: str  # Renamed from finding_type for clarity
+    file: str = ""  # File where finding was detected
 
 
 class PrototypePollutionAnalyzer:
     """
-    Analyzer for detecting prototype pollution vulnerabilities.
+    Analyzer for detecting prototype pollution findings.
     
     This class implements various heuristics and patterns to identify
     potential prototype pollution issues in JavaScript code and HTML files.
+    Findings include confirmed vulnerabilities and suspicious patterns requiring review.
     """
     
     # Common dangerous property names that could lead to pollution
@@ -55,6 +57,29 @@ class PrototypePollutionAnalyzer:
     
     SAFE_TARGET_CREATORS = {"Object.create"}  # Object.create(null) target is safer
     
+    # NEW: Framework-specific safe patterns
+    # These libraries have built-in prototype pollution protection
+    SAFE_LIBRARY_MERGE = {
+        "$.extend",  # jQuery with deep=false is safe
+        "jQuery.extend",
+        "_.assign",  # Lodash assign (shallow) is safe
+        "lodash.assign",
+        "Object.getOwnPropertyDescriptor",  # Safe - only copies descriptors
+        "Object.getOwnPropertyDescriptors",  # Safe - only own properties
+    }
+    
+    # NEW: Variables commonly used as hasOwnProperty aliases
+    HAS_OWN_PROPERTY_ALIASES = {
+        "hasOwn", "hasOwnProp", "has", "hop", "hasProperty"
+    }
+    
+    # NEW: Safe property whitelists - if only copying these properties, it's safe
+    SAFE_PROPERTY_NAMES = {
+        "value", "writable", "enumerable", "configurable",  # Property descriptors
+        "get", "set",  # Accessors
+        "name", "length", "type", "id", "className", "style",  # Common safe properties
+    }
+    
     def __init__(self, verbose: bool = False):
         """
         Initialize the analyzer.
@@ -63,7 +88,7 @@ class PrototypePollutionAnalyzer:
             verbose: Enable verbose output
         """
         self.verbose = verbose
-        self.vulnerabilities: List[Vulnerability] = []
+        self.findings: List[Finding] = []  # Renamed from vulnerabilities
         self.sources: List[Dict[str, Any]] = []
         self.tainted_vars: Dict[Tuple[str, str], Dict[str, Any]] = {}  # (file, var_name) -> source_info
         self.function_calls: List[Dict[str, Any]] = []
@@ -85,7 +110,7 @@ class PrototypePollutionAnalyzer:
         Call this between analyses to prevent state bleeding across projects.
         Alternatively, create a new analyzer instance per project.
         """
-        self.vulnerabilities = []
+        self.findings = []
         self.sources = []
         self.tainted_vars = {}
         self.tainted_keys = {}
@@ -96,7 +121,7 @@ class PrototypePollutionAnalyzer:
         self.sink_function_names = set()
         self._seen_vulns = set()
     
-    def analyze_ast(self, ast: Dict[str, Any]) -> List[Vulnerability]:
+    def analyze_ast(self, ast: Dict[str, Any]) -> List[Finding]:
         """
         Analyze an AST for prototype pollution vulnerabilities.
         
@@ -106,7 +131,7 @@ class PrototypePollutionAnalyzer:
             ast: Parsed AST dictionary (from parser)
             
         Returns:
-            List of detected vulnerabilities
+            List of detected findings
         """
         # Store AST for later cross-file analysis
         self.all_asts.append(ast)
@@ -124,7 +149,7 @@ class PrototypePollutionAnalyzer:
             # Analyze JavaScript for merge/extend functions
             self._analyze_javascript_code(ast)
         
-        return self.vulnerabilities
+        return self.findings
     
     def finalize_analysis(self) -> None:
         """
@@ -217,7 +242,7 @@ class PrototypePollutionAnalyzer:
                         f"This could lead to prototype pollution."
                     ),
                     code_snippet=assign.get("code", ""),
-                    vulnerability_type="direct_dangerous_property_assignment",
+                    finding_type="direct_dangerous_property_assignment",
                     file=ast.get("file", ""),
                 )
     
@@ -284,9 +309,12 @@ class PrototypePollutionAnalyzer:
         Detect data sources that could contain user-controlled input.
         
         Sources include:
-        - JSON.parse() calls
+        - JSON.parse() calls (when parsing potentially user-controlled data)
         - DOM attribute parsing (getAttribute, dataset, etc.)
         - User input handling (form inputs, etc.)
+        
+        NOTE: Not all JSON.parse calls are user-controlled. We mark them as potential
+        sources but should validate if the data is actually from user input.
         
         Args:
             ast: Parsed AST dictionary
@@ -300,14 +328,20 @@ class PrototypePollutionAnalyzer:
         
         # Also check json_parse_calls extracted by parser
         for json_call in ast.get("json_parse_calls", []):
-            self.sources.append({
-                "type": "json_parse",
-                "line": json_call.get("line"),
-                "column": json_call.get("column"),
-                "code": json_call.get("code", ""),
-                "variable": None,  # Will be extracted from AST
-                "file": filename,
-            })
+            # NEW: Try to determine if this JSON.parse is parsing user-controlled data
+            code = json_call.get("code", "")
+            is_likely_user_controlled = self._is_likely_user_controlled_json_parse(code)
+            
+            # Only add if it's likely user-controlled
+            if is_likely_user_controlled:
+                self.sources.append({
+                    "type": "json_parse",
+                    "line": json_call.get("line"),
+                    "column": json_call.get("column"),
+                    "code": code,
+                    "variable": None,  # Will be extracted from AST
+                    "file": filename,
+                })
     
     def _find_sources_in_ast(self, node: Any, parent: Optional[Any] = None, filename: str = "unknown") -> None:
         """
@@ -428,6 +462,47 @@ class PrototypePollutionAnalyzer:
                 for item in value:
                     if isinstance(item, dict):
                         self._find_sources_in_ast(item, node, filename)
+    
+    def _is_likely_user_controlled_json_parse(self, code: str) -> bool:
+        """
+        Heuristic to determine if a JSON.parse call is parsing user-controlled data.
+        
+        Args:
+            code: The code snippet containing JSON.parse
+            
+        Returns:
+            True if likely user-controlled, False otherwise
+        """
+        code_lower = code.lower()
+        
+        # Strong indicators of user-controlled data
+        user_controlled_indicators = [
+            "getattribute", "dataset", "queryselector", "getelementby",
+            "request", "req.body", "req.query", "req.params",
+            ".value", "input", "form", "localstorage", "sessionstorage",
+            "cookie", "location", "window.name", "postmessage"
+        ]
+        
+        # Indicators of non-user-controlled data (config, constants, etc.)
+        not_user_controlled_indicators = [
+            "config", "constant", "default", "schema", "template",
+            "json.parse('{", 'json.parse("{', "json.parse('[",
+            "stringify"  # JSON.parse(JSON.stringify(...)) is not user input
+        ]
+        
+        # Check for strong user-controlled indicators
+        for indicator in user_controlled_indicators:
+            if indicator in code_lower:
+                return True
+        
+        # Check for indicators that it's NOT user-controlled
+        for indicator in not_user_controlled_indicators:
+            if indicator in code_lower:
+                return False
+        
+        # Default: be conservative and assume it could be user-controlled
+        # (but this could be adjusted based on project needs)
+        return True
     
     def _get_assigned_variable(self, node: Any, parent: Optional[Any] = None) -> Optional[str]:
         """
@@ -912,7 +987,7 @@ class PrototypePollutionAnalyzer:
                 column=func_column,
                 message=message,
                 code_snippet=code_snippet,
-                vulnerability_type=analysis_result.get("vulnerability_type", "vulnerable_function"),
+                finding_type=analysis_result.get("finding_type", "vulnerable_function"),
                 file=ast.get("file", ""),
             )
     
@@ -994,7 +1069,7 @@ class PrototypePollutionAnalyzer:
             "is_vulnerable": False,
             "severity": "low",
             "message": "",
-            "vulnerability_type": "",
+            "finding_type": "",  # Renamed from finding_type
             "source_info": None,
             "has_key_taint": False,  # NEW: Pass this up
         }
@@ -1029,14 +1104,14 @@ class PrototypePollutionAnalyzer:
                     result["severity"] = "medium"
                 
                 if is_recursive:
-                    result["vulnerability_type"] = "vulnerable_recursive_merge"
+                    result["finding_type"] = "vulnerable_recursive_merge"
                 else:
-                    result["vulnerability_type"] = "vulnerable_property_assignment"
+                    result["finding_type"] = "vulnerable_property_assignment"
                 
                 result["source_info"] = source_info
                 
                 if source_info:
-                    result["vulnerability_type"] = "source_to_sink_pollution"
+                    result["finding_type"] = "source_to_sink_pollution"
                     result["message"] = (
                         f"Function '{func_name if func_name else '(anonymous)'}' receives data from "
                         f"{source_info['type']} source and performs property copying/merging "
@@ -1058,7 +1133,7 @@ class PrototypePollutionAnalyzer:
             elif sink_analysis["has_partial_validation"]:
                 result["is_vulnerable"] = True
                 result["severity"] = "medium"
-                result["vulnerability_type"] = "partially_safe_recursive_merge"
+                result["finding_type"] = "partially_safe_recursive_merge"
                 result["source_info"] = source_info
                 result["message"] = (
                     f"Function '{func_name if func_name else '(anonymous)'}' performs deep property copying "
@@ -1217,13 +1292,13 @@ class PrototypePollutionAnalyzer:
                     call_line = call.get("line")
                     call_file = call.get("file")
                     
-                    # Find corresponding vulnerability for this sink function
+                    # Find corresponding finding for this sink function
                     matched = False
-                    for vuln in self.vulnerabilities:
+                    for finding in self.findings:
                         # Match by function name in message or by checking if it's the sink function
-                        if func_name and (func_name.lower() in vuln.message.lower() or 
-                                         self._vulnerability_matches_function(vuln, func_name)):
-                            # Enhance vulnerability with source information
+                        if func_name and (func_name.lower() in finding.message.lower() or 
+                                         self._finding_matches_function(finding, func_name)):
+                            # Enhance finding with source information
                             taint_arg = tainted_args[0]
                             taint_info = taint_arg["taint_info"]
                             
@@ -1236,10 +1311,13 @@ class PrototypePollutionAnalyzer:
                                     "variable": None,
                                     "direct": True,
                                 }
-                                vuln.message = (
-                                    f"Function '{func_name}' receives tainted data directly from {source_info['type']} source "
-                                    f"at line {call_line} in {call_file} and performs property copying/merging "
-                                    f"without validating dangerous properties. This creates a prototype pollution vulnerability."
+                                # IMPROVED: Make taint path more explicit for direct sources
+                                taint_path = f"\n  TAINT PATH: {source_info['type'].upper()} (line {call_line}, {call_file}) → {func_name}() call (same line)"
+                                
+                                finding.message = (
+                                    f"Prototype Pollution: Function '{func_name}' receives tainted data directly from {source_info['type']} source "
+                                    f"and performs property copying/merging without validating dangerous properties."
+                                    f"{taint_path}"
                                 )
                             else:
                                 # Tainted variable passed as argument
@@ -1251,15 +1329,19 @@ class PrototypePollutionAnalyzer:
                                     "direct": False,
                                 }
                                 var_info = f"via variable '{source_info['variable']}'" if source_info["variable"] else ""
-                                vuln.message = (
-                                    f"Function '{func_name}' receives tainted data from {source_info['type']} source "
-                                    f"(line {source_info['line']} in {source_info['file']}) {var_info} "
-                                    f"and performs property copying/merging without validating dangerous properties. "
-                                    f"This creates a prototype pollution vulnerability. "
-                                    f"Tainted data flows from source to sink at line {call_line} in {call_file}."
+                                # IMPROVED: Make taint path more explicit
+                                taint_path = f"\n  TAINT PATH: {source_info['type'].upper()} (line {source_info['line']}, {source_info['file']})"
+                                if source_info["variable"]:
+                                    taint_path += f" → variable '{source_info['variable']}'"
+                                taint_path += f" → {func_name}() call (line {call_line}, {call_file})"
+                                
+                                finding.message = (
+                                    f"Prototype Pollution: Function '{func_name}' receives tainted data from {source_info['type']} source "
+                                    f"{var_info} and performs property copying/merging without validating dangerous properties."
+                                    f"{taint_path}"
                                 )
                             
-                            vuln.vulnerability_type = "source_to_sink_pollution"
+                            finding.finding_type = "source_to_sink_pollution"
                             matched = True
                             break
                     
@@ -1269,18 +1351,25 @@ class PrototypePollutionAnalyzer:
                         taint_info = taint_arg["taint_info"]
                         
                         if taint_arg.get("is_direct_source"):
+                            # IMPROVED: Add explicit taint path for direct sources
+                            taint_path = f"\n  TAINT PATH: {taint_info.get('source_type', 'unknown').upper()} (line {call_line}, {call_file}) → {func_name}() call (same line)"
                             message = (
-                                f"Call to '{func_name}' at line {call_line} receives tainted data "
-                                f"directly from {taint_info.get('source_type', 'unknown')} source. "
-                                f"This may cause prototype pollution."
+                                f"Prototype Pollution: Call to '{func_name}' receives tainted data "
+                                f"directly from {taint_info.get('source_type', 'unknown')} source."
+                                f"{taint_path}"
                             )
                         else:
-                            var_info = f"via variable '{taint_arg.get('variable')}'" if taint_arg.get("variable") else ""
+                            # IMPROVED: Add explicit taint path for variable-mediated taints
+                            var_info = taint_arg.get('variable')
+                            taint_path = f"\n  TAINT PATH: {taint_info.get('source_type', 'unknown').upper()} (line {taint_info.get('source_line')}, {taint_info.get('source_file')})"
+                            if var_info:
+                                taint_path += f" → variable '{var_info}'"
+                            taint_path += f" → {func_name}() call (line {call_line}, {call_file})"
+                            
                             message = (
-                                f"Call to '{func_name}' at line {call_line} receives tainted data "
-                                f"from {taint_info.get('source_type', 'unknown')} source "
-                                f"(line {taint_info.get('source_line')} in {taint_info.get('source_file')}) {var_info}. "
-                                f"This may cause prototype pollution."
+                                f"Prototype Pollution: Call to '{func_name}' receives tainted data "
+                                f"from {taint_info.get('source_type', 'unknown')} source."
+                                f"{taint_path}"
                             )
                         
                         self._add_vuln(
@@ -1289,27 +1378,27 @@ class PrototypePollutionAnalyzer:
                             column=0,
                             message=message,
                             code_snippet="",
-                            vulnerability_type="source_to_sink_pollution",
+                            finding_type="source_to_sink_pollution",
                             file=call_file or "",
                         )
     
-    def _vulnerability_matches_function(self, vuln: Vulnerability, func_name: str) -> bool:
+    def _finding_matches_function(self, finding: Finding, func_name: str) -> bool:
         """
-        Check if vulnerability is for a specific function.
+        Check if finding is for a specific function.
         
         Args:
-            vuln: Vulnerability object
+            finding: Finding object
             func_name: Function name to match
             
         Returns:
-            True if vulnerability matches function
+            True if finding matches function
         """
-        # Extract function name from vulnerability message
-        if func_name.lower() in vuln.message.lower():
+        # Extract function name from finding message
+        if func_name.lower() in finding.message.lower():
             return True
         
         # Check code snippet
-        if func_name.lower() in vuln.code_snippet.lower():
+        if func_name.lower() in finding.code_snippet.lower():
             return True
         
         return False
@@ -1392,9 +1481,9 @@ class PrototypePollutionAnalyzer:
         return list(set(used_vars))  # Remove duplicates
     
     def _add_vuln(self, *, severity: str, line: int, column: int, message: str,
-                  code_snippet: str, vulnerability_type: str, file: str) -> None:
+                  code_snippet: str, finding_type: str, file: str) -> None:
         """
-        Add vulnerability with deduplication.
+        Add finding with deduplication.
         
         Args:
             severity: Vulnerability severity
@@ -1402,20 +1491,20 @@ class PrototypePollutionAnalyzer:
             column: Column number
             message: Vulnerability message
             code_snippet: Code snippet
-            vulnerability_type: Type of vulnerability
+            finding_type: Type of vulnerability
             file: File path
         """
-        key = (file or "", int(line or 0), int(column or 0), vulnerability_type or "")
+        key = (file or "", int(line or 0), int(column or 0), finding_type or "")
         if key in self._seen_vulns:
             return
         self._seen_vulns.add(key)
-        self.vulnerabilities.append(Vulnerability(
+        self.findings.append(Finding(
             severity=severity,
             line=line,
             column=column,
             message=message,
             code_snippet=code_snippet,
-            vulnerability_type=vulnerability_type,
+            finding_type=finding_type,
             file=file
         ))
     
@@ -1465,14 +1554,30 @@ class PrototypePollutionAnalyzer:
                     # Try to get the key identifier for guard correlation
                     key_node = left.get("property", {})
                     key_name = key_node.get("name") if key_node.get("type") == "Identifier" else None
-                    result["has_sink"] = True
-                    guards = self._is_guarded(node, key_name=key_name)
-                    result["has_validation"] = guards["full"]
-                    result["has_partial_validation"] = guards["partial"]
                     
-                    # NEW: If the key variable itself is tainted, mark key taint
-                    if key_name and key_name in self.tainted_keys:
-                        result["has_key_taint"] = True
+                    # NEW: If key is a literal (target['specificKey'] = ...), it's generally safe
+                    # unless it's a dangerous literal
+                    if key_node.get("type") == "Literal":
+                        literal_key = str(key_node.get("value", ""))
+                        if literal_key not in self.DANGEROUS_PROPERTIES:
+                            # Safe literal key assignment - skip
+                            pass
+                        else:
+                            # Dangerous literal like target['__proto__'] = ...
+                            result["has_sink"] = True
+                            guards = self._is_guarded(node, key_name=None)
+                            result["has_validation"] = guards["full"]
+                            result["has_partial_validation"] = guards["partial"]
+                    else:
+                        # Dynamic key from variable
+                        result["has_sink"] = True
+                        guards = self._is_guarded(node, key_name=key_name)
+                        result["has_validation"] = guards["full"]
+                        result["has_partial_validation"] = guards["partial"]
+                        
+                        # NEW: If the key variable itself is tainted, mark key taint
+                        if key_name and key_name in self.tainted_keys:
+                            result["has_key_taint"] = True
         
         # 2) Call-based sinks
         elif ntype == "CallExpression":
@@ -1488,12 +1593,20 @@ class PrototypePollutionAnalyzer:
                     if args and args[0].get("type") == "CallExpression":
                         c2 = args[0].get("callee", {})
                         if self._get_function_name_from_ast(c2) in self.SAFE_TARGET_CREATORS:
-                            # Treated as validated because prototype is null
-                            result["has_validation"] = True
+                            # Check if Object.create is called with null
+                            create_args = args[0].get("arguments", [])
+                            if create_args and create_args[0].get("type") == "Literal" and create_args[0].get("value") is None:
+                                # Treated as validated because prototype is null
+                                result["has_validation"] = True
             
             # Recursive call to same function (deep merge)
             if callee_name == func_name:
                 result["is_recursive"] = True
+            
+            # NEW: Check if this is a known safe library merge
+            if callee_name in self.SAFE_LIBRARY_MERGE:
+                # These libraries have built-in protection
+                result["has_validation"] = True
             
             # Library helpers (extend/merge-like): treat as sink
             if not result["has_sink"] and callee_name:
@@ -1532,7 +1645,9 @@ class PrototypePollutionAnalyzer:
         """
         Walk ancestors and determine whether the sink is dominated by:
         - A full exclusion check: key !== "__proto__" && key !== "constructor" && key !== "prototype"
-        - Or an own-property check: foo.hasOwnProperty(key) OR Object.prototype.hasOwnProperty.call(foo, key) (counts as partial)
+        - Or an own-property check: foo.hasOwnProperty(key) OR Object.prototype.hasOwnProperty.call(foo, key)
+        - Or use of Object.keys() for key iteration (SAFE - only own properties)
+        - Or property whitelisting (only specific safe properties are copied)
         
         Returns {"full": bool, "partial": bool}
         
@@ -1547,6 +1662,16 @@ class PrototypePollutionAnalyzer:
         partial = False
         cur = sink_node
         seen = set()
+        
+        # NEW: Check if we're iterating using Object.keys() or Object.getOwnPropertyNames() - this is SAFE
+        if self._is_using_safe_key_iteration(sink_node, key_name):
+            full = True
+            return {"full": full, "partial": partial}
+        
+        # NEW: Check if we're only copying whitelisted safe properties
+        if self._is_property_whitelisted(sink_node, key_name):
+            full = True
+            return {"full": full, "partial": partial}
         
         while cur and id(cur) not in seen:
             seen.add(id(cur))
@@ -1565,13 +1690,182 @@ class PrototypePollutionAnalyzer:
                     partial = True
                 
                 if self._if_test_has_hasOwnProperty(test, key_name):
-                    # hasOwnProperty prevents prototype chain keys but doesn't exclude
-                    # dangerous own properties like "__proto__", so treat as partial
-                    partial = True
+                    # UPDATED: hasOwnProperty is actually FULL validation because:
+                    # - Object.prototype.hasOwnProperty.call(obj, "__proto__") returns false
+                    # - "__proto__" is not an own property, it's inherited from prototype chain
+                    # Therefore, hasOwnProperty effectively blocks __proto__, constructor, prototype
+                    full = True
             
             cur = parent
         
         return {"full": full, "partial": partial}
+    
+    def _is_using_safe_key_iteration(self, sink_node: Dict[str, Any], key_name: Optional[str]) -> bool:
+        """
+        Check if the sink is within a loop that uses Object.keys() or Object.getOwnPropertyNames().
+        These methods only return own properties, not inherited ones like __proto__.
+        
+        Args:
+            sink_node: Sink node
+            key_name: Name of the key variable being iterated
+            
+        Returns:
+            True if using safe key iteration method
+        """
+        if not key_name:
+            return False
+        
+        cur = sink_node
+        seen = set()
+        
+        while cur and id(cur) not in seen:
+            seen.add(id(cur))
+            parent = self.parent_map.get(id(cur))
+            if not parent:
+                break
+            
+            ptype = parent.get("type")
+            
+            # Check for various loop patterns
+            if ptype in ("ForStatement", "WhileStatement"):
+                # Look for patterns like: for (var i = 0; i < keys.length; i++)
+                # where keys = Object.keys(obj) or keys = Object.getOwnPropertyNames(obj)
+                
+                # Try to find the array being iterated
+                if self._is_array_from_safe_method(parent, key_name):
+                    return True
+            
+            elif ptype == "ForOfStatement":
+                # for (const key of Object.keys(obj))
+                left = parent.get("left", {})
+                right = parent.get("right", {})
+                
+                # Check if the key variable matches
+                if left.get("type") == "VariableDeclaration":
+                    declarations = left.get("declarations", [])
+                    for decl in declarations:
+                        var_id = decl.get("id", {})
+                        if var_id.get("name") == key_name:
+                            # Check if right side is Object.keys() or Object.getOwnPropertyNames()
+                            if right.get("type") == "CallExpression":
+                                callee_name = self._get_function_name_from_ast(right.get("callee", {}))
+                                if callee_name in ("Object.keys", "Object.getOwnPropertyNames"):
+                                    return True
+            
+            elif ptype == "CallExpression":
+                # Pattern: Object.keys(obj).forEach(function(key) { ... })
+                # or: Object.getOwnPropertyNames(obj).forEach(function(key) { ... })
+                callee = parent.get("callee", {})
+                if callee.get("type") == "MemberExpression":
+                    obj = callee.get("object", {})
+                    prop = callee.get("property", {})
+                    
+                    if prop.get("name") == "forEach" and obj.get("type") == "CallExpression":
+                        obj_callee_name = self._get_function_name_from_ast(obj.get("callee", {}))
+                        if obj_callee_name in ("Object.keys", "Object.getOwnPropertyNames"):
+                            # Check if the callback parameter matches key_name
+                            args = parent.get("arguments", [])
+                            if args and args[0].get("type") in ("FunctionExpression", "ArrowFunctionExpression"):
+                                params = args[0].get("params", [])
+                                if params and params[0].get("name") == key_name:
+                                    return True
+            
+            cur = parent
+        
+        return False
+    
+    def _is_array_from_safe_method(self, loop_node: Dict[str, Any], key_name: Optional[str]) -> bool:
+        """
+        Check if a loop iterates over an array created by Object.keys() or similar.
+        
+        Args:
+            loop_node: Loop node (ForStatement, WhileStatement, etc.)
+            key_name: Name of the key variable
+            
+        Returns:
+            True if the array comes from a safe method
+        """
+        # This is a simplified check - in a real implementation, we'd need to track
+        # variable assignments more thoroughly
+        # For now, we'll return False as a conservative approach
+        return False
+    
+    def _is_property_whitelisted(self, sink_node: Dict[str, Any], key_name: Optional[str]) -> bool:
+        """
+        Check if the sink only copies specific whitelisted safe properties.
+        For example: if (key === 'value' || key === 'name') { target[key] = source[key]; }
+        
+        Args:
+            sink_node: Sink node
+            key_name: Name of the key variable
+            
+        Returns:
+            True if only whitelisted properties are being copied
+        """
+        if not key_name:
+            return False
+        
+        cur = sink_node
+        seen = set()
+        
+        while cur and id(cur) not in seen:
+            seen.add(id(cur))
+            parent = self.parent_map.get(id(cur))
+            if not parent:
+                break
+            
+            ptype = parent.get("type")
+            
+            if ptype == "IfStatement":
+                test = parent.get("test", {})
+                whitelisted_props = self._get_whitelisted_properties(test, key_name)
+                
+                # If we found a whitelist and all properties are safe, it's protected
+                if whitelisted_props and whitelisted_props.issubset(self.SAFE_PROPERTY_NAMES):
+                    return True
+            
+            cur = parent
+        
+        return False
+    
+    def _get_whitelisted_properties(self, test_node: Dict[str, Any], key_name: Optional[str]) -> Set[str]:
+        """
+        Extract whitelisted property names from a test expression.
+        For example: key === 'value' || key === 'name' → {'value', 'name'}
+        
+        Args:
+            test_node: Test expression node
+            key_name: Name of the key variable
+            
+        Returns:
+            Set of property names in the whitelist
+        """
+        props: Set[str] = set()
+        if not isinstance(test_node, dict):
+            return props
+        
+        ntype = test_node.get("type")
+        
+        if ntype == "BinaryExpression":
+            op = test_node.get("operator")
+            if op in ("===", "=="):
+                left = test_node.get("left", {})
+                right = test_node.get("right", {})
+                
+                # Check for: key === 'propertyName'
+                if left.get("type") == "Identifier" and left.get("name") == key_name:
+                    if right.get("type") == "Literal" and isinstance(right.get("value"), str):
+                        props.add(right.get("value"))
+                elif right.get("type") == "Identifier" and right.get("name") == key_name:
+                    if left.get("type") == "Literal" and isinstance(left.get("value"), str):
+                        props.add(left.get("value"))
+        
+        elif ntype == "LogicalExpression":
+            # Collect from both sides of || or &&
+            props |= self._get_whitelisted_properties(test_node.get("left", {}), key_name)
+            props |= self._get_whitelisted_properties(test_node.get("right", {}), key_name)
+        
+        return props
     
     def _collect_dangerous_exclusions(self, test_node: Dict[str, Any], key_name: Optional[str]) -> Set[str]:
         """
@@ -1617,6 +1911,7 @@ class PrototypePollutionAnalyzer:
     def _if_test_has_hasOwnProperty(self, test_node: Dict[str, Any], key_name: Optional[str]) -> bool:
         """
         Detect hasOwnProperty guards in an if() test.
+        Now also recognizes common aliases like hasOwn, hop, etc.
         
         Args:
             test_node: Test expression node
@@ -1641,6 +1936,16 @@ class PrototypePollutionAnalyzer:
             # Object.prototype.hasOwnProperty.call(obj, key)
             if name == "Object.prototype.hasOwnProperty.call" and len(args) >= 2:
                 return (key_name is None) or (args[1].get("type") == "Identifier" and args[1].get("name") == key_name)
+            
+            # NEW: Recognize common hasOwnProperty aliases (hasOwn, hop, etc.)
+            if name:
+                func_base = name.split(".")[-1]
+                if func_base in self.HAS_OWN_PROPERTY_ALIASES:
+                    # Check if it's called with key parameter
+                    if len(args) >= 2:  # hasOwn(obj, key) or hasOwn.call(obj, key)
+                        return (key_name is None) or (args[1].get("type") == "Identifier" and args[1].get("name") == key_name)
+                    elif len(args) >= 1:  # obj.hasOwn(key)
+                        return (key_name is None) or (args[0].get("type") == "Identifier" and args[0].get("name") == key_name)
         elif ntype in ("LogicalExpression", "BinaryExpression"):
             return (self._if_test_has_hasOwnProperty(test_node.get("left", {}), key_name) or
                     self._if_test_has_hasOwnProperty(test_node.get("right", {}), key_name))
@@ -1677,6 +1982,7 @@ class PrototypePollutionAnalyzer:
     def _get_function_name_from_ast(self, callee: Dict[str, Any]) -> Optional[str]:
         """
         Extract function name from a CallExpression callee AST node.
+        Handles deep chains like Object.prototype.hasOwnProperty.call
         
         Args:
             callee: Callee AST node
@@ -1687,40 +1993,57 @@ class PrototypePollutionAnalyzer:
         if callee.get("type") == "Identifier":
             return callee.get("name")
         elif callee.get("type") == "MemberExpression":
-            obj = callee.get("object", {})
-            prop = callee.get("property", {})
-            if obj.get("type") == "Identifier" and prop.get("type") == "Identifier":
-                return f"{obj.get('name')}.{prop.get('name')}"
+            # IMPROVED: Recursively build the full member expression chain
+            parts = []
+            current = callee
+            
+            while current and current.get("type") == "MemberExpression":
+                prop = current.get("property", {})
+                if prop.get("type") == "Identifier":
+                    parts.insert(0, prop.get("name"))
+                elif prop.get("type") == "Literal":
+                    parts.insert(0, str(prop.get("value")))
+                else:
+                    break
+                
+                current = current.get("object", {})
+            
+            # Get the root object
+            if current and current.get("type") == "Identifier":
+                parts.insert(0, current.get("name"))
+            
+            if parts:
+                return ".".join(parts)
         
         return None
     
-    def get_vulnerability_report(self) -> Dict[str, Any]:
+    def get_finding_report(self) -> Dict[str, Any]:
         """
-        Generate a detailed vulnerability report.
+        Generate a detailed finding report.
         
         Returns:
-            Dictionary containing vulnerability statistics and details
+            Dictionary containing finding statistics and details
         """
         return {
-            "total_vulnerabilities": len(self.vulnerabilities),
+            "total_findings": len(self.findings),
             "by_severity": {
-                "high": len([v for v in self.vulnerabilities if v.severity == "high"]),
-                "medium": len([v for v in self.vulnerabilities if v.severity == "medium"]),
-                "low": len([v for v in self.vulnerabilities if v.severity == "low"]),
+                "high": len([v for v in self.findings if v.severity == "high"]),
+                "medium": len([v for v in self.findings if v.severity == "medium"]),
+                "low": len([v for v in self.findings if v.severity == "low"]),
             },
             "by_type": self._group_by_type(),
-            "vulnerabilities": self.vulnerabilities,
+            "findings": self.findings,
         }
     
     def _group_by_type(self) -> Dict[str, int]:
         """
-        Group vulnerabilities by type.
+        Group findings by type.
         
         Returns:
-            Dictionary mapping vulnerability types to counts
+            Dictionary mapping finding types to counts
         """
         type_counts = {}
-        for vuln in self.vulnerabilities:
-            vuln_type = vuln.vulnerability_type
-            type_counts[vuln_type] = type_counts.get(vuln_type, 0) + 1
+        for finding in self.findings:
+            finding_type = finding.finding_type
+            type_counts[finding_type] = type_counts.get(finding_type, 0) + 1
         return type_counts

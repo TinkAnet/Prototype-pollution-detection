@@ -10,13 +10,13 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 from .parser import JavaScriptParser
-from .analysis import PrototypePollutionAnalyzer, Vulnerability
+from .analysis import PrototypePollutionAnalyzer, Finding
 from .validate import DynamicValidator
 
 
 class PrototypePollutionDetector:
     """
-    Main detector class for prototype pollution vulnerabilities.
+    Main detector class for prototype pollution findings.
     
     This class coordinates the parsing and analysis of JavaScript code
     to detect potential prototype pollution issues.
@@ -40,7 +40,7 @@ class PrototypePollutionDetector:
         
         Args:
             path: Path to a JavaScript file or directory
-            dynamic_verify: Whether to attempt dynamic verification of vulnerabilities
+            dynamic_verify: Whether to attempt dynamic verification of findings
             
         Returns:
             Dictionary containing analysis results
@@ -83,23 +83,23 @@ class PrototypePollutionDetector:
             # Parse the file
             ast = self.parser.parse_file(file_path)
             
-            # Analyze for vulnerabilities
-            vulnerabilities = self.analyzer.analyze_ast(ast)
+            # Analyze for findings
+            findings = self.analyzer.analyze_ast(ast)
             
             result = {
                 "file": str(file_path),
-                "vulnerabilities": [
+                "findings": [
                     {
                         "severity": v.severity,
                         "line": v.line,
                         "column": v.column,
                         "message": v.message,
                         "code_snippet": v.code_snippet,
-                        "type": v.vulnerability_type,
+                        "type": v.finding_type,
                     }
-                    for v in vulnerabilities
+                    for v in findings
                 ],
-                "vulnerability_count": len(vulnerabilities),
+                "finding_count": len(findings),
             }
             
             # Perform dynamic verification if requested
@@ -140,7 +140,7 @@ class PrototypePollutionDetector:
         results = {
             "directory": str(dir_path),
             "files": [],
-            "total_vulnerabilities": 0,
+            "total_findings": 0,
         }
         
         # Find all JavaScript and HTML files
@@ -152,18 +152,18 @@ class PrototypePollutionDetector:
         for js_file in js_files:
             file_result = self._analyze_file(js_file, dynamic_verify)
             results["files"].append(file_result)
-            if file_result.get("vulnerability_count", 0) > 0:
+            if file_result.get("finding_count", 0) > 0:
                  # Static analysis updates are handled here, but cross-file is separate
                  pass
         
         # Second pass: Perform cross-file taint analysis (static only for now)
         self.analyzer.finalize_analysis()
         
-        # Update results with final vulnerabilities
-        final_vulns = self.analyzer.vulnerabilities
-        results["total_vulnerabilities"] = len(final_vulns)
+        # Update results with final findings
+        final_vulns = self.analyzer.findings
+        results["total_findings"] = len(final_vulns)
         
-        # Update file results with final vulnerabilities
+        # Update file results with final findings
         for file_result in results["files"]:
             file_path = file_result.get("file", "")
             
@@ -177,18 +177,18 @@ class PrototypePollutionDetector:
                 elif file_path in str(v.code_snippet) or file_path in v.message:
                     file_vulns.append(v)
             
-            file_result["vulnerabilities"] = [
+            file_result["findings"] = [
                 {
                     "severity": v.severity,
                     "line": v.line,
                     "column": v.column,
                     "message": v.message,
                     "code_snippet": v.code_snippet,
-                    "type": v.vulnerability_type,
+                    "type": v.finding_type,
                 }
                 for v in file_vulns
             ]
-            file_result["vulnerability_count"] = len(file_vulns)
+            file_result["finding_count"] = len(file_vulns)
         
         return results
     
@@ -202,7 +202,7 @@ class PrototypePollutionDetector:
         if "directory" in results:
             print(f"\n=== Analysis Results for {results['directory']} ===\n")
             print(f"Files analyzed: {len(results['files'])}")
-            print(f"Total vulnerabilities found (Static): {results['total_vulnerabilities']}\n")
+            print(f"Total findings found (Static): {results['total_findings']}\n")
             
             for file_result in results["files"]:
                 self._print_single_file_result(file_result)
@@ -225,11 +225,11 @@ class PrototypePollutionDetector:
             print(f"[-] {file_path}: Error - {result['error']}")
             return
 
-        vuln_count = result.get("vulnerability_count", 0)
+        vuln_count = result.get("finding_count", 0)
         dynamic = result.get("dynamic_verification")
         
         status_symbol = "[+]"
-        status_msg = "No vulnerabilities detected"
+        status_msg = "No findings detected"
         
         if vuln_count > 0:
             status_symbol = "[!]"
@@ -246,7 +246,7 @@ class PrototypePollutionDetector:
         
         print(f"{status_symbol} {file_path}: {status_msg}")
                 
-        for vuln in result.get("vulnerabilities", []):
+        for vuln in result.get("findings", []):
             print(f"   [{vuln['severity'].upper()}] Line {vuln['line']}: {vuln['message']}")
             if header and vuln['code_snippet']:
                 print(f"     Code: {vuln['code_snippet']}")

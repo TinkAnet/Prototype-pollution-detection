@@ -18,7 +18,7 @@ class LLMAnalysisResult:
     is_vulnerable: bool
     confidence: float  # 0.0 to 1.0
     explanation: str
-    vulnerability_type: Optional[str] = None
+    finding_type: Optional[str] = None  # Renamed from vulnerability_type
     severity: Optional[str] = None
 
 
@@ -134,7 +134,7 @@ class LLMAnalyzer:
                     "is_vulnerable": result.is_vulnerable,
                     "confidence": result.confidence,
                     "explanation": result.explanation,
-                    "vulnerability_type": result.vulnerability_type,
+                    "finding_type": result.finding_type,
                     "severity": result.severity,
                 }
                 analyzed.append(snippet)
@@ -176,7 +176,7 @@ Respond in JSON format:
 {
     "is_vulnerable": true/false,
     "confidence": 0.0-1.0,
-    "vulnerability_type": "type or null",
+    "finding_type": "type or null",
     "severity": "high/medium/low or null",
     "explanation": "brief explanation"
 }
@@ -216,7 +216,7 @@ Be precise and conservative - only flag code that is clearly vulnerable or highl
                     is_vulnerable=data.get("is_vulnerable", False),
                     confidence=float(data.get("confidence", 0.0)),
                     explanation=data.get("explanation", ""),
-                    vulnerability_type=data.get("vulnerability_type"),
+                    finding_type=data.get("finding_type"),
                     severity=data.get("severity"),
                 )
         except (json.JSONDecodeError, ValueError, KeyError) as e:
