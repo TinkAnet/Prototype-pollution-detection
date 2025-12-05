@@ -1,9 +1,7 @@
 # Prototype Pollution Detection Tool
 
-A static analysis tool for detecting prototype pollution vulnerabilities in JavaScript and HTML files using semantic AST analysis and taint tracking.
+A static analysis tool for detecting prototype pollution vulnerabilities in JavaScript and HTML files using semantic AST analysis and taint trackin.
 
-**Group Project** - Web Security Class at Johns Hopkins University  
-**Team:** Letao Zhao, Ethan Lee, Bingyan He, Qi Sun
 
 ## What is Prototype Pollution?
 
